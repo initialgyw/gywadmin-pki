@@ -1,0 +1,21 @@
+[package]
+name = "gywadmin-pki"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pki"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+getrandom = "0.3.4"
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+time = "0.3.44"
+x509-parser = "0.18.1"
+zeroize = "1.8.2"
+tempfile = "3.27.0"
+
+[dev-dependencies]
