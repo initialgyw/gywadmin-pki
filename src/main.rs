@@ -51,6 +51,32 @@ struct CertificateRecord {
     domains: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+enum KeyUsage {
+    #[value(name = "digital-signature")]
+    DigitalSignature,
+    #[value(name = "key-encipherment")]
+    KeyEncipherment,
+    #[value(name = "key-cert-sign")]
+    KeyCertSign,
+    #[value(name = "crl-sign")]
+    CrlSign,
+    #[value(name = "key-agreement")]
+    KeyAgreement,
+}
+
+impl KeyUsage {
+    fn text(self) -> &'static str {
+        match self {
+            Self::DigitalSignature => "digitalSignature",
+            Self::KeyEncipherment => "keyEncipherment",
+            Self::KeyCertSign => "keyCertSign",
+            Self::CrlSign => "cRLSign",
+            Self::KeyAgreement => "keyAgreement",
+        }
+    }
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum Profile {
     #[value(name = "ecdsa-p256")]
@@ -134,17 +160,52 @@ impl SubjectArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+struct CreateCaArgs {
+    #[command(flatten)]
+    subject: SubjectArgs,
+    #[arg(long, help = "Required safe directory name for the CA.")]
+    name: String,
+    #[arg(
+        long,
+        value_enum,
+        help = "Root profile is required; intermediate profile defaults to the parent profile."
+    )]
+    profile: Option<Profile>,
+    #[arg(long, help = "Optional parent selector; omitted creates a root CA.")]
+    parent: Option<String>,
+    #[arg(
+        long,
+        help = "Root lifetime defaults to 5y; intermediate lifetime defaults to 2y."
+    )]
+    days: Option<CertificateDuration>,
+    #[arg(
+        long,
+        help = "Optional maximum subordinate CA depth. Root omission means no explicit constraint; intermediate omission defaults to 0."
+    )]
+    pathlen: Option<u32>,
+    #[arg(long = "key-usage", value_enum)]
+    key_usage: Vec<KeyUsage>,
+    #[arg(
+        long,
+        help = "Passphrase file for the new CA key; omit to generate one during execution."
+    )]
+    passphrase_file: Option<PathBuf>,
+    #[arg(
+        long = "parent-passphrase-file",
+        help = "Passphrase file for the existing parent CA key; defaults to the parent's private/ca.passphrase."
+    )]
+    parent_passphrase_file: Option<PathBuf>,
+    #[arg(long)]
+    do_it: bool,
+}
+
+#[derive(Debug, Clone, Args)]
 struct RootArgs {
     #[command(flatten)]
     subject: SubjectArgs,
     #[arg(long, help = "Required unique directory name for this root CA.")]
     name: String,
-    #[arg(
-        long,
-        value_enum,
-        default_value = "ecdsa-p256",
-        help = "Optional key profile. Defaults to ecdsa-p256."
-    )]
+    #[arg(long, value_enum, help = "Required key profile.")]
     profile: Profile,
     #[arg(
         long,
@@ -152,12 +213,10 @@ struct RootArgs {
         help = "Optional lifetime: a number of days or a number ending in d, w, m, or y. Defaults to 5y; months are 30 days and years are 365 days."
     )]
     days: CertificateDuration,
-    #[arg(
-        long,
-        default_value_t = 1,
-        help = "Optional maximum subordinate CA depth. Defaults to 1."
-    )]
-    pathlen: u32,
+    #[arg(long, help = "Optional maximum subordinate CA depth.")]
+    pathlen: Option<u32>,
+    #[arg(long = "key-usage", value_enum, help = "Repeatable X.509 key usage.")]
+    key_usage: Vec<KeyUsage>,
     #[arg(
         long,
         help = "Optional existing passphrase file; otherwise one is generated during execution."
@@ -193,12 +252,10 @@ struct IntermediateArgs {
         help = "Optional lifetime: a number of days or a number ending in d, w, m, or y. Defaults to 2y; months are 30 days and years are 365 days."
     )]
     days: CertificateDuration,
-    #[arg(
-        long,
-        default_value_t = 0,
-        help = "Optional maximum subordinate CA depth. Defaults to 0."
-    )]
-    pathlen: u32,
+    #[arg(long, help = "Optional maximum subordinate CA depth.")]
+    pathlen: Option<u32>,
+    #[arg(long = "key-usage", value_enum, help = "Repeatable X.509 key usage.")]
+    key_usage: Vec<KeyUsage>,
     #[arg(
         long,
         help = "Optional existing passphrase file; otherwise one is generated during execution."
@@ -247,6 +304,8 @@ struct CertArgs {
         help = "Required DNS name or IP address; repeat for multiple SANs."
     )]
     san: Vec<String>,
+    #[arg(long = "key-usage", value_enum, help = "Repeatable X.509 key usage.")]
+    key_usage: Vec<KeyUsage>,
     #[arg(long, hide = true)]
     dns: Vec<String>,
     #[arg(long, hide = true)]
@@ -378,8 +437,7 @@ struct Cli {
 #[derive(Debug, Clone, Subcommand)]
 enum Operation {
     Check,
-    CreateRootCa(RootArgs),
-    CreateIntermediateCa(IntermediateArgs),
+    CreateCa(CreateCaArgs),
     CreateCert(CertArgs),
     List,
 }
@@ -447,6 +505,9 @@ fn main() {
     match result {
         Ok(mut report) => {
             report.commands = openssl.commands;
+            if cli.verbose && !report.dry_run {
+                print_artifact_provenance(&cli.dir, &report.paths, &report.commands);
+            }
             if json {
                 println!("{}", serde_json::to_string(&report).unwrap());
             } else if let Some(certificates) = report.certificates {
@@ -458,6 +519,9 @@ fn main() {
             } else {
                 if cli.verbose {
                     print_verbose_commands(&report.commands);
+                    if report.dry_run {
+                        print_planned_provenance(&report);
+                    }
                 }
                 print_planned_root(&report);
                 println!("ok: {}", report.message);
@@ -497,14 +561,59 @@ fn execute(cli: &Cli, openssl: &mut OpenSsl) -> Result<Report, (u8, String)> {
     if !cli.dir.is_dir() {
         return Err((3, "--dir must be an existing directory".into()));
     }
+    if let Operation::CreateCa(args) = &cli.command
+        && args.parent.is_none()
+        && args.parent_passphrase_file.is_some()
+    {
+        return Err((
+            4,
+            "--parent-passphrase-file is only valid with --parent".into(),
+        ));
+    }
     openssl
         .run(&["version".into()])
         .map_err(|error| (8, error))?;
     match &cli.command {
         Operation::Check => Ok(success("OpenSSL verified", true)),
+        Operation::CreateCa(args) => {
+            if let Some(parent) = &args.parent {
+                let intermediate = IntermediateArgs {
+                    subject: args.subject.clone(),
+                    profile: args.profile.clone(),
+                    name: args.name.clone(),
+                    parent: parent.clone(),
+                    days: args
+                        .days
+                        .clone()
+                        .unwrap_or_else(|| "2y".parse().expect("static duration")),
+                    pathlen: args.pathlen,
+                    key_usage: args.key_usage.clone(),
+                    passphrase_file: args.passphrase_file.clone(),
+                    issuer_passphrase_file: args.parent_passphrase_file.clone(),
+                    do_it: args.do_it,
+                };
+                create_intermediate(&cli.dir, openssl, &intermediate)
+            } else {
+                let root = RootArgs {
+                    subject: args.subject.clone(),
+                    name: args.name.clone(),
+                    profile: args
+                        .profile
+                        .clone()
+                        .ok_or((4, "--profile is required when --parent is omitted".into()))?,
+                    days: args
+                        .days
+                        .clone()
+                        .unwrap_or_else(|| "5y".parse().expect("static duration")),
+                    pathlen: args.pathlen,
+                    key_usage: args.key_usage.clone(),
+                    passphrase_file: args.passphrase_file.clone(),
+                    do_it: args.do_it,
+                };
+                create_root(&cli.dir, openssl, &root)
+            }
+        }
         Operation::List => list_certificates(&cli.dir, openssl, cli.verbose),
-        Operation::CreateRootCa(args) => create_root(&cli.dir, openssl, args),
-        Operation::CreateIntermediateCa(args) => create_intermediate(&cli.dir, openssl, args),
         Operation::CreateCert(args) => create_certificate(&cli.dir, openssl, args),
     }
 }
@@ -527,8 +636,10 @@ fn success(message: &str, dry_run: bool) -> Report {
 
 fn create_root(dir: &Path, openssl: &mut OpenSsl, args: &RootArgs) -> Result<Report, (u8, String)> {
     validate_subject(&args.subject)?;
+    validate_key_usages(&args.key_usage, true)?;
     let days = normalized_days(&args.days, 1, 7300)?;
     validate_name(&args.name)?;
+    ensure_unique_ca_name(dir, &args.name)?;
     let target = dir
         .join(args.profile.text())
         .join("root")
@@ -541,6 +652,7 @@ fn create_root(dir: &Path, openssl: &mut OpenSsl, args: &RootArgs) -> Result<Rep
     let key = target.join("private/ca.key.pem");
     let cert = target.join("certs/ca.cert.pem");
     let ext = target.join("config/ca.ext");
+    validate_key_usages(&args.key_usage, true)?;
     let planned_commands = root_command_plan(args, &key, &cert, days);
     let planned_artifacts = root_artifact_plan(dir, &target, args.passphrase_file.is_none());
     if !args.do_it {
@@ -559,7 +671,7 @@ fn create_root(dir: &Path, openssl: &mut OpenSsl, args: &RootArgs) -> Result<Rep
     fs::create_dir_all(target.join("config")).map_err(fs_error)?;
     let pass = passphrase(args.passphrase_file.as_deref(), dir, &target, openssl)?;
     generate_key(openssl, &args.profile, &key, &pass)?;
-    write_new(&ext, &format!("basicConstraints=critical,CA:TRUE,pathlen:{}\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always,issuer\n", args.pathlen)).map_err(fs_error)?;
+    write_new(&ext, &format!("basicConstraints=critical,CA:TRUE{}\nkeyUsage=critical,{}\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always,issuer\n", args.pathlen.map_or(String::new(), |value| format!(",pathlen:{value}")), key_usages(&args.key_usage, true))).map_err(fs_error)?;
     let mut root_certificate_args = vec![
         "req".into(),
         "-x509".into(),
@@ -580,16 +692,22 @@ fn create_root(dir: &Path, openssl: &mut OpenSsl, args: &RootArgs) -> Result<Rep
         "-subj".into(),
         args.subject.distinguished_name(),
         "-addext".into(),
-        format!("basicConstraints=critical,CA:TRUE,pathlen:{}", args.pathlen),
+        format!(
+            "basicConstraints=critical,CA:TRUE{}",
+            args.pathlen
+                .map_or(String::new(), |v| format!(",pathlen:{v}"))
+        ),
         "-addext".into(),
-        "keyUsage=critical,keyCertSign,cRLSign".into(),
+        format!("keyUsage=critical,{}", key_usages(&args.key_usage, true)),
         "-out".into(),
         cert.display().to_string(),
     ]);
     run_to_file(openssl, root_certificate_args)?;
     write_new(&target.join("index.txt"), "").map_err(fs_error)?;
     write_new(&target.join("serial"), "1000\n").map_err(fs_error)?;
-    Ok(success_with_path("root CA created", false, relative))
+    let mut report = success_with_path("root CA created", false, relative);
+    report.paths = root_artifact_plan(dir, &target, true);
+    Ok(report)
 }
 
 fn create_intermediate(
@@ -598,7 +716,15 @@ fn create_intermediate(
     args: &IntermediateArgs,
 ) -> Result<Report, (u8, String)> {
     validate_name(&args.name)?;
+    if args.issuer_passphrase_file.is_some() && args.parent.trim().is_empty() {
+        return Err((
+            4,
+            "--parent is required when using --parent-passphrase-file".into(),
+        ));
+    }
     let days = normalized_days(&args.days, 1, 3650)?;
+    let pathlen = args.pathlen.unwrap_or(0);
+    validate_key_usages(&args.key_usage, true)?;
     let parent = resolve_issuer(dir, &args.parent)?;
     let parent_subject = read_subject(&parent.path)?;
     let subject = inherited_subject(&parent_subject, &args.subject);
@@ -646,6 +772,7 @@ fn create_intermediate(
         &extension,
         &subject,
         days,
+        &args.key_usage,
     );
     let planned_artifacts =
         intermediate_artifact_plan(dir, &target, &extension, args.passphrase_file.is_none());
@@ -671,12 +798,11 @@ fn create_intermediate(
         .as_deref()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| parent_default_passphrase(&parent.path));
-    let issuer_pass = read_passphrase(dir, &issuer_passphrase_file).map_err(|(_, message)| {
+    read_passphrase(dir, &issuer_passphrase_file).map_err(|(_, message)| {
         (
             4,
             format!(
-                "cannot read parent passphrase file {}: {message}; provide --issuer-passphrase-file to override the default",
-                issuer_passphrase_file.display()
+                "cannot read parent passphrase file: {message}; provide --parent-passphrase-file to override the default"
             ),
         )
     })?;
@@ -689,7 +815,7 @@ fn create_intermediate(
             "-key".into(),
             key.display().to_string(),
             "-passin".into(),
-            format!("pass:{pass}"),
+            format!("file:{}", target.join("private/ca.passphrase").display()),
             "-subj".into(),
             subject.distinguished_name(),
             "-out".into(),
@@ -715,13 +841,13 @@ fn create_intermediate(
                 .display()
                 .to_string(),
             "-passin".into(),
-            format!("pass:{issuer_pass}"),
+            format!("file:{}", issuer_passphrase_file.display()),
             "-days".into(),
             days.to_string(),
             "-set_serial".into(),
             "1000".into(),
             "-extfile".into(),
-            write_extension(dir, &args.name, args.pathlen)?
+            write_extension(dir, &args.name, pathlen, &args.key_usage)?
                 .display()
                 .to_string(),
             "-out".into(),
@@ -731,11 +857,9 @@ fn create_intermediate(
     write_new(&target.join("index.txt"), "").map_err(fs_error)?;
     write_new(&target.join("serial"), "1000\n").map_err(fs_error)?;
     let _ = write_chain(&target, &parent.path, &cert);
-    Ok(success_with_path(
-        "intermediate CA created",
-        false,
-        relative,
-    ))
+    let mut report = success_with_path("intermediate CA created", false, relative);
+    report.paths = intermediate_artifact_plan(dir, &target, &extension, true);
+    Ok(report)
 }
 
 fn create_certificate(
@@ -746,6 +870,7 @@ fn create_certificate(
     validate_name(&args.name)?;
     let days = normalized_days(&args.days, 1, 397)?;
     let sans = normalize_sans(args)?;
+    validate_key_usages(&args.key_usage, false)?;
     let issuer = resolve_issuer(dir, &args.issuer)?;
     let parent_subject = read_subject(&issuer.path)?;
     let subject = inherited_subject(&parent_subject, &args.subject);
@@ -784,15 +909,8 @@ fn create_certificate(
         .as_deref()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| parent_default_passphrase(&issuer.path));
-    let issuer_pass = read_passphrase(dir, &issuer_passphrase_file).map_err(|(_, message)| {
-        (
-            4,
-            format!(
-                "cannot read issuer passphrase file {}: {message}",
-                issuer_passphrase_file.display()
-            ),
-        )
-    })?;
+    read_passphrase(dir, &issuer_passphrase_file)
+        .map_err(|(_, message)| (4, format!("cannot read issuer passphrase file: {message}")))?;
     if let Some(path) = &args.passphrase_file {
         read_passphrase(dir, path)?;
     }
@@ -868,14 +986,14 @@ fn create_certificate(
             "-key".into(),
             key.display().to_string(),
             "-passin".into(),
-            format!("pass:{pass}"),
+            format!("file:{}", passphrase_file.display()),
             "-subj".into(),
             subject.distinguished_name(),
             "-out".into(),
             csr.display().to_string(),
         ],
     )?;
-    let ext = match write_leaf_extension(&target, &sans) {
+    let ext = match write_leaf_extension(&target, &sans, &args.key_usage) {
         Ok(path) => path,
         Err(error) => {
             let _ = fs::remove_dir_all(&cleanup_target);
@@ -895,7 +1013,7 @@ fn create_certificate(
             "-CAkey".into(),
             issuer_key.display().to_string(),
             "-passin".into(),
-            format!("pass:{issuer_pass}"),
+            format!("file:{}", issuer_passphrase_file.display()),
             "-days".into(),
             days.to_string(),
             "-set_serial".into(),
@@ -908,7 +1026,9 @@ fn create_certificate(
     )?;
     write_chain(&target, &issuer_cert, &cert)
         .map_err(|error| (6, format!("cannot write certificate chain: {error}")))?;
-    Ok(success_with_path("certificate created", false, relative))
+    let mut report = success_with_path("certificate created", false, relative);
+    report.paths = certificate_artifact_plan(dir, &target, true);
+    Ok(report)
 }
 
 fn generate_key(
@@ -1102,18 +1222,55 @@ fn resolve_issuer(dir: &Path, selector: &str) -> Result<ResolvedIssuer, (u8, Str
     ))
 }
 
+fn ensure_unique_ca_name(dir: &Path, name: &str) -> Result<(), (u8, String)> {
+    let conflicts = Profile::all()
+        .into_iter()
+        .flat_map(|profile| {
+            [
+                dir.join(profile.text()).join("root").join(name).join("ca"),
+                dir.join(profile.text())
+                    .join("intermediate")
+                    .join(name)
+                    .join("ca"),
+            ]
+            .into_iter()
+        })
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err((5, format!("CA name is already in use: {name}")))
+}
+
 fn intermediate_extension_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(".pki-intermediate-ext").join(name)
 }
 
-fn write_extension(dir: &Path, name: &str, pathlen: u32) -> Result<PathBuf, (u8, String)> {
+fn write_extension(
+    dir: &Path,
+    name: &str,
+    pathlen: u32,
+    usages: &[KeyUsage],
+) -> Result<PathBuf, (u8, String)> {
     let file = intermediate_extension_path(dir, name);
     fs::create_dir_all(file.parent().unwrap()).map_err(fs_error)?;
-    write_new(&file, &format!("basicConstraints=critical,CA:TRUE,pathlen:{pathlen}\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n")).map_err(fs_error)?;
+    write_new(
+        &file,
+        &format!(
+            "basicConstraints=critical,CA:TRUE,pathlen:{pathlen}\nkeyUsage=critical,{}\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n",
+            key_usages(usages, true)
+        ),
+    )
+    .map_err(fs_error)?;
     Ok(file)
 }
 
-fn write_leaf_extension(target: &Path, sans: &[String]) -> Result<PathBuf, (u8, String)> {
+fn write_leaf_extension(
+    target: &Path,
+    sans: &[String],
+    usages: &[KeyUsage],
+) -> Result<PathBuf, (u8, String)> {
     let file = target.join("config/leaf-ext.cnf");
     let values = sans
         .iter()
@@ -1126,7 +1283,14 @@ fn write_leaf_extension(target: &Path, sans: &[String]) -> Result<PathBuf, (u8, 
         })
         .collect::<Vec<_>>()
         .join(",");
-    write_new(&file, &format!("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName={values}\n")).map_err(fs_error)?;
+    write_new(
+        &file,
+        &format!(
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,{}\nextendedKeyUsage=serverAuth\nsubjectAltName={values}\n",
+            key_usages(usages, false)
+        ),
+    )
+    .map_err(fs_error)?;
     Ok(file)
 }
 
@@ -1137,6 +1301,38 @@ fn write_chain(target: &Path, issuer: &Path, cert: &Path) -> Result<(), std::io:
     let mut full = cert_bytes;
     full.extend(issuer_bytes);
     fs::write(target.join("chain/fullchain.pem"), full)
+}
+
+fn key_usages(usages: &[KeyUsage], ca: bool) -> String {
+    if usages.is_empty() {
+        return if ca {
+            "keyCertSign,cRLSign".into()
+        } else {
+            "digitalSignature,keyEncipherment".into()
+        };
+    }
+    usages
+        .iter()
+        .map(|usage| usage.text())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn validate_key_usages(usages: &[KeyUsage], ca: bool) -> Result<(), (u8, String)> {
+    if ca && !usages.is_empty() && !usages.contains(&KeyUsage::KeyCertSign) {
+        return Err((4, "CA key usage must include key-cert-sign".into()));
+    }
+    if !ca
+        && usages
+            .iter()
+            .any(|usage| matches!(usage, KeyUsage::KeyCertSign | KeyUsage::CrlSign))
+    {
+        return Err((
+            4,
+            "leaf key usage cannot include key-cert-sign or crl-sign".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_sans(args: &CertArgs) -> Result<Vec<String>, (u8, String)> {
@@ -1317,9 +1513,13 @@ fn root_command_plan(args: &RootArgs, key: &Path, cert: &Path, days: u32) -> Vec
         "-subj".into(),
         args.subject.distinguished_name(),
         "-addext".into(),
-        format!("basicConstraints=critical,CA:TRUE,pathlen:{}", args.pathlen),
+        format!(
+            "basicConstraints=critical,CA:TRUE{}",
+            args.pathlen
+                .map_or(String::new(), |v| format!(",pathlen:{v}"))
+        ),
         "-addext".into(),
-        "keyUsage=critical,keyCertSign,cRLSign".into(),
+        format!("keyUsage=critical,{}", key_usages(&args.key_usage, true)),
         "-out".into(),
         cert.display().to_string(),
     ]);
@@ -1370,6 +1570,7 @@ fn intermediate_command_plan(
     extension: &Path,
     subject: &SubjectArgs,
     days: u32,
+    usages: &[KeyUsage],
 ) -> Vec<Vec<String>> {
     let key_command = if matches!(profile, Profile::Rsa4096) {
         vec![
@@ -1437,6 +1638,7 @@ fn intermediate_command_plan(
         "-out".into(),
         cert.display().to_string(),
     ];
+    let _ = usages;
     vec![key_command, csr_command, signing_command]
 }
 
@@ -1558,6 +1760,203 @@ fn intermediate_artifact_plan(
     artifacts
 }
 
+fn print_planned_provenance(report: &Report) {
+    println!("planned artifacts:");
+    for relative in &report.planned_artifacts {
+        let (creator, purpose, method) = artifact_provenance(relative);
+        println!("  file: {relative}");
+        println!("  created by: {creator}");
+        println!("  purpose: {purpose}");
+        if let Some(command) = planned_command_for_artifact(relative, &report.planned_commands) {
+            println!("  command:");
+            print_multiline_command(command, "    ");
+        } else {
+            println!("  generation: {method}");
+            print_planned_content(relative);
+        }
+    }
+}
+
+fn planned_command_for_artifact<'a>(
+    relative: &str,
+    commands: &'a [Vec<String>],
+) -> Option<&'a Vec<String>> {
+    commands.iter().find(|command| {
+        command.iter().any(|argument| argument == relative)
+            || command.iter().any(|argument| argument.ends_with(relative))
+    })
+}
+
+fn print_planned_content(relative: &str) {
+    if relative.ends_with(".key.pem") || relative.ends_with("passphrase") {
+        println!("  contents: hidden; sensitive file");
+    } else if relative.ends_with(".ext") || relative.ends_with("-ext.cnf") {
+        println!(
+            "  contents: exact extension text is generated from basicConstraints, keyUsage, subjectKeyIdentifier, authorityKeyIdentifier, and SAN settings"
+        );
+        println!(
+            "  note: root signing uses inline -addext arguments; the root ca.ext file is metadata and is not consumed by the displayed root command"
+        );
+    } else if relative.ends_with("/index.txt") {
+        println!("  contents: empty file, 0 bytes");
+    } else if relative.ends_with("/serial") {
+        println!("  contents: 1000 followed by a newline");
+    } else if relative.ends_with("issuer-chain.pem") {
+        println!("  contents: copy the parent or issuer certificate-chain bytes");
+    } else if relative.ends_with("fullchain.pem") {
+        println!("  contents: concatenate the leaf certificate with the issuer chain");
+    } else {
+        println!("  contents: generated by the application during execution");
+    }
+}
+
+fn print_artifact_provenance(dir: &Path, paths: &[String], commands: &[CommandReport]) {
+    println!("created files:");
+    for relative in paths {
+        let target = dir.join(relative);
+        if !target.is_file() {
+            continue;
+        }
+        let (creator, purpose, _method) = artifact_provenance(relative);
+        println!("  file: {relative}");
+        println!("  created by: {creator}");
+        let (_, _, method) = artifact_provenance(relative);
+        println!("  purpose: {purpose}");
+        println!("  method: {method}");
+        if let Some(command) = commands
+            .iter()
+            .find(|command| command_creates(command, &target))
+        {
+            println!("  command:");
+            print_multiline_command(&command.argv, "    ");
+        }
+        if is_sensitive_path(&target) {
+            println!("  contents: hidden; sensitive file");
+        } else if let Ok(contents) = fs::read_to_string(&target) {
+            println!("  contents:");
+            println!("{contents}");
+        } else {
+            println!("  contents: hidden; binary or unreadable");
+        }
+    }
+}
+
+fn artifact_provenance(relative: &str) -> (&'static str, &'static str, &'static str) {
+    if relative.ends_with(".key.pem") {
+        (
+            "OpenSSL",
+            "private key used by the CA or certificate",
+            "run the planned key-generation command",
+        )
+    } else if relative.ends_with(".passphrase") || relative.ends_with("/passphrase") {
+        (
+            "pki application",
+            "passphrase used to protect or unlock a private key",
+            "read or generate the passphrase; generated values use 32 secure random bytes encoded as 64 lowercase hexadecimal characters followed by a newline",
+        )
+    } else if relative.ends_with(".ext") || relative.ends_with("-ext.cnf") {
+        (
+            "pki application",
+            "OpenSSL X.509 extension configuration",
+            "write the exact extension configuration text; root certificates use inline -addext arguments, while signed certificates use this file with -extfile",
+        )
+    } else if relative.ends_with(".csr.pem") {
+        (
+            "OpenSSL",
+            "certificate signing request submitted for signing",
+            "run the planned openssl req -new command",
+        )
+    } else if relative.ends_with(".cert.pem") || relative.ends_with("/cert.pem") {
+        (
+            "OpenSSL",
+            "public certificate",
+            "run the planned certificate command",
+        )
+    } else if relative.ends_with("issuer-chain.pem") || relative.ends_with("fullchain.pem") {
+        (
+            "pki application",
+            "certificate-chain bundle assembled from certificate files",
+            "copy and concatenate certificate bytes in chain order",
+        )
+    } else if relative.ends_with("/index.txt") {
+        (
+            "pki application",
+            "OpenSSL CA database index",
+            "create an empty 0-byte text file",
+        )
+    } else if relative.ends_with("/serial") {
+        (
+            "pki application",
+            "CA database state",
+            "write the initial serial value 1000 followed by a newline",
+        )
+    } else {
+        (
+            "pki application",
+            "created operation artifact",
+            "write the planned artifact",
+        )
+    }
+}
+
+fn command_creates(command: &CommandReport, target: &Path) -> bool {
+    let target_text = target.to_string_lossy();
+    command
+        .argv
+        .iter()
+        .any(|argument| argument == target_text.as_ref())
+}
+
+fn is_sensitive_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.contains("/private/") || text.ends_with(".key.pem") || text.ends_with("passphrase")
+}
+
+fn print_multiline_command(command: &[String], indent: &str) {
+    if let Some((program, arguments)) = command.split_first() {
+        let mut lines = Vec::new();
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = &arguments[index];
+            if argument.starts_with('-')
+                && !argument.starts_with("--")
+                && index + 1 < arguments.len()
+                && !arguments[index + 1].starts_with('-')
+            {
+                lines.push(format!(
+                    "{} {}",
+                    shell_quote(argument),
+                    shell_quote(&arguments[index + 1])
+                ));
+                index += 2;
+            } else {
+                lines.push(shell_quote(argument));
+                index += 1;
+            }
+        }
+        if let Some(first) = lines.first() {
+            println!("{indent}$ {program} {first} \\");
+            for (index, line) in lines.iter().skip(1).enumerate() {
+                let suffix = if index + 2 == lines.len() { "" } else { " \\" };
+                println!("{indent}    {line}{suffix}");
+            }
+        } else {
+            println!("{indent}$ {program}");
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || ".:/_-".contains(character))
+    {
+        value.to_owned()
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+}
+
 fn print_planned_root(report: &Report) {
     if !report.planned_commands.is_empty() {
         let label = if report
@@ -1581,7 +1980,7 @@ fn print_planned_root(report: &Report) {
         }
         println!("planned OpenSSL commands:");
         for command in &report.planned_commands {
-            println!("  $ {}", command.join(" "));
+            print_multiline_command(command, "  ");
         }
     }
 }
@@ -1929,7 +2328,7 @@ fn render_record_branch(
 }
 fn print_verbose_commands(commands: &[CommandReport]) {
     for command in commands {
-        println!("$ {}", command.argv.join(" "));
+        print_multiline_command(&command.argv, "");
         println!(
             "status: {} (exit code: {:?})",
             command.success, command.code

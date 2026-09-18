@@ -155,11 +155,11 @@ pki [OPTIONS] --dir <DIR> <COMMAND>
 | `-h`, `--help` | Show help. |
 | `-V`, `--version` | Show the version. |
 
-Global options must appear before the subcommand. `--do-it` is not global: it is accepted only by `create-root-ca`, `create-intermediate-ca`, and `create-cert`, and must appear after that selected subcommand. `check --do-it` is rejected. For example:
+Global options must appear before the subcommand. `--do-it` is not global: it is accepted only by `create-ca` and `create-cert`, and must appear after that selected subcommand. `check --do-it` is rejected. For example:
 
 ```sh
 pki --dir ./pki --output json check
-pki --dir ./pki create-root-ca --name example-root --common-name "Example Root CA" --organization Example --do-it
+pki --dir ./pki create-ca --name example-root --common-name "Example Root CA" --organization Example --do-it
 ```
 
 ## First use: dry run before execution
@@ -168,7 +168,7 @@ All create commands are dry runs unless their command-local `--do-it` flag is pr
 
 ```sh
 pki --dir ./pki \
-  create-root-ca \
+  create-ca \
   --name example-root \
   --profile ed25519 \
   --common-name "Example Root CA" \
@@ -272,7 +272,15 @@ docker run --rm \
 
 `check` verifies that OpenSSL is available and that the configured OpenSSL installation supports the Ed25519 operations required by the tool. It does not modify the PKI directory.
 
-## Create a root CA
+## Create a CA
+
+Use `create-ca` for both root and intermediate CAs. The presence of `--parent` determines the kind:
+
+- Without `--parent`, the command creates a self-signed root CA.
+- With `--parent`, the command creates an intermediate CA signed by that parent.
+
+
+### Root CA
 
 A root CA is self-signed and becomes the trust anchor for its profile.
 
@@ -280,7 +288,7 @@ Dry run:
 
 ```sh
 pki --dir ./pki \
-  create-root-ca \
+  create-ca \
   --name example-root \
   --profile ed25519 \
   --common-name "Example Root CA" \
@@ -292,7 +300,7 @@ Execute:
 
 ```sh
 pki --dir ./pki \
-  create-root-ca --do-it \
+  create-ca --do-it \
   --name example-root \
   --profile ed25519 \
   --common-name "Example Root CA" \
@@ -304,14 +312,14 @@ Important options:
 
 | Option | Description | Default |
 |---|---|---:|
-| `--name` | Required unique safe directory name for this root CA. | — |
+| `--name` | Required globally unique safe directory name across all root and intermediate CAs and profiles. | — |
 | `--profile` | `ecdsa-p256`, `ed25519`, or `rsa-4096` | `ecdsa-p256` |
 | `--common-name` | Required CA common name. `--cn` is an alias. | — |
 | `--organization` | Required organization name. | — |
 | `--days` | Lifetime as days or `d`, `w`, `m`, or `y`; bare numbers mean days. `1m` is 30 days and `1y` is 365 days. | `5y` |
-| `--pathlen` | Maximum permitted subordinate CA depth. | `1` |
+| `--pathlen` | Optional maximum permitted subordinate CA depth. Omitted means no explicit path-length constraint; use `--pathlen 0` to forbid subordinate CAs. | omitted |
 | `--passphrase-file` | Existing file for the encrypted root key, or omit to generate `<dir>/<profile>/root/<name>/ca/private/ca.passphrase` during execution. | generated when omitted |
-| `--do-it` | Execute this root CA operation; place it after `create-root-ca`. | dry run |
+| `--do-it` | Execute this root CA operation; place it after `create-ca`. | dry run |
 
 The root is stored at:
 
@@ -319,7 +327,7 @@ The root is stored at:
 <dir>/<profile>/root/<name>/ca/
 ```
 
-Multiple roots may use the same profile when their names differ. Existing legacy roots at `<dir>/<profile>/root/ca/` remain readable through the selector `root`; named roots use `root:<name>`.
+CA names are globally unique across all root and intermediate CAs and profiles. Existing legacy roots at `<dir>/<profile>/root/ca/` remain readable through the selector `root`; named roots use `root:<name>`. A name collision returns exit code 5 and identifies the existing CA.
 
 ## Create an intermediate CA
 
@@ -329,30 +337,30 @@ An intermediate CA is signed by a parent CA. The parent can be the root or anoth
 
 ```sh
 pki --dir ./pki \
-  create-intermediate-ca --do-it \
+  create-ca --do-it \
   --profile ed25519 \
   --name issuing \
   --parent root \
   --common-name "Example Issuing CA" \
   --organization Example \
-  --pathlen 0 \
-  --passphrase-file issuing.pass \
-  --issuer-passphrase-file root.pass
+   --pathlen 0 \
+   --passphrase-file issuing.pass \
+   --parent-passphrase-file root.pass
 ```
 
 ### Nested intermediate
 
 ```sh
 pki --dir ./pki \
-  create-intermediate-ca --do-it \
+  create-ca --do-it \
   --profile ed25519 \
   --name nested \
   --parent intermediate:issuing \
   --common-name "Example Nested CA" \
   --organization Example \
-  --pathlen 0 \
-  --passphrase-file nested.pass \
-  --issuer-passphrase-file issuing.pass
+   --pathlen 0 \
+   --passphrase-file nested.pass \
+   --parent-passphrase-file issuing.pass
 ```
 
 Important options:
@@ -360,7 +368,7 @@ Important options:
 | Option | Description | Default |
 |---|---|---:|
 | `--profile` | Optional key profile. If omitted, the immediate parent CA profile is inherited; an explicit profile must match the parent. | inherited from parent |
-| `--name` | Safe directory name for the new intermediate. | — |
+| `--name` | Globally unique safe directory name across all root and intermediate CAs and profiles. | — |
 | `--parent` | `root`, `root:<name>`, or `intermediate:<name>`. The parent profile is used when `--profile` is omitted. | — |
 | `--common-name` | Required CA common name. `--cn` is an alias. | — |
 | `--organization` | Optional organization name; inherited from the parent when omitted. | inherited from parent |
@@ -369,10 +377,10 @@ Important options:
 | `--state` | Optional state; inherited from the parent when omitted. | inherited from parent |
 | `--locality` | Optional locality; inherited from the parent when omitted. | inherited from parent |
 | `--days` | Lifetime as days or `d`, `w`, `m`, or `y`; bare numbers mean days. | `2y` |
-| `--pathlen` | Permitted subordinate CA depth. | `0` |
-| `--passphrase-file` | Existing file for the new intermediate key, or omit to generate `private/ca.passphrase` during execution. | generated when omitted |
-| `--issuer-passphrase-file` | Optional parent CA passphrase file. If omitted, use the parent's `private/ca.passphrase`. | parent default |
-| `--do-it` | Execute this intermediate CA operation; place it after `create-intermediate-ca`. | dry run |
+| `--pathlen` | Optional permitted subordinate CA depth. Omission defaults to `0` for intermediate CAs. | `0` |
+| `--passphrase-file` | Passphrase file for the new intermediate CA key, or omit to generate `private/ca.passphrase` during execution. | generated when omitted |
+| `--parent-passphrase-file` | Passphrase file for the existing parent CA key. If omitted, use the parent's `private/ca.passphrase`. | parent default |
+| `--do-it` | Execute this intermediate CA operation; place it after `create-ca`. | dry run |
 
 Intermediate CAs are stored at:
 
@@ -380,7 +388,7 @@ Intermediate CAs are stored at:
 <dir>/<profile>/intermediate/<name>/ca/
 ```
 
-The child must not outlive its issuer. Its path length must be lower than the issuer’s available path length. Parent selectors are resolved across the supported profile directories; ambiguous selectors fail instead of choosing a parent arbitrarily. Intermediate dry runs also show the planned key-generation, CSR, and signing OpenSSL commands, planned artifacts, inherited profile, and normalized lifetime without creating files.
+The child must not outlive its issuer. Its path length must be lower than the issuer’s available path length. CA names are globally unique, so parent selectors resolve to one CA across the supported profile directories; pre-existing ambiguous layouts still fail instead of choosing a parent arbitrarily. Intermediate dry runs also show the planned key-generation, CSR, and signing OpenSSL commands, planned artifacts, inherited profile, and normalized lifetime without creating files.
 
 ## Create a certificate signed by the root
 
@@ -532,7 +540,7 @@ Private directories use mode `0700`. Private keys and CA database/configuration 
 Use `-v` or `--verbose` before the subcommand to add a safe execution report. Human output retains its normal success/error line and final target path; verbose mode then lists the root, intermediate, or leaf operation context, issuer/parent selector, sanitized OpenSSL argv, lifecycle phase (`preflight`, `validation`, or `execution`), success status, exit code or signal, and stdout/stderr byte counts.
 
 ```sh
-pki --dir ./pki --verbose create-root-ca --do-it \
+pki --dir ./pki --verbose create-ca --do-it \
   --common-name "Example Root CA" --organization Example --passphrase-file root.pass
 pki --dir ./pki --verbose --json create-cert --do-it --root \
   --name service --common-name service.example --organization Example \
@@ -678,7 +686,7 @@ docker run --rm \
   --mount "type=bind,src=$work,dst=/data/pki" \
   gywadmin-pki:local \
   --dir /data/pki \
-  create-root-ca --do-it \
+  create-ca --do-it \
   --profile ed25519 \
    --name example-root \
    --common-name "Example Root" \
@@ -702,3 +710,7 @@ docker run --rm \
 
 rm -rf "$work"
 ```
+
+## Certificate key usage
+
+Certificate-producing commands accept repeatable typed `--key-usage` values. CA defaults are `key-cert-sign,crl-sign`; leaf defaults are `digital-signature,key-encipherment`.

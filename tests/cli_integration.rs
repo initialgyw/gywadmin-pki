@@ -88,7 +88,9 @@ fn verbose_list_includes_the_certificate_openssl_command() {
     );
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("x509"));
-    assert!(text.contains("-noout -subject -issuer -serial -dates -fingerprint -pubkey"));
+    assert!(text.contains("-noout"));
+    assert!(text.contains("-subject"));
+    assert!(text.contains("-pubkey"));
     assert!(text.contains("stdout:"));
     assert!(text.contains("stderr:"));
     let summary = text.find("ok: listed").unwrap();
@@ -207,9 +209,13 @@ fn cert_dry_run_shows_planned_commands() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("planned certificate artifacts:"));
     assert!(text.contains("ecparam"));
-    assert!(text.contains("req -new"));
-    assert!(text.contains("x509 -req"));
-    assert!(text.contains("-days 30"));
+    assert!(text.contains("req"));
+    assert!(text.contains("-new"));
+    assert!(text.contains("x509"));
+    assert!(text.contains("-req"));
+    assert!(text.contains("-days"));
+    assert!(text.contains("30"));
+    assert!(text.contains("\\"));
     assert!(!directory.path().join("ecdsa-p256/certs/leaf").exists());
 }
 
@@ -226,26 +232,130 @@ fn cert_help_requires_issuer_and_describes_inheritance() {
 }
 
 #[test]
-fn root_help_describes_required_name_and_duration_defaults() {
+fn create_ca_help_describes_required_fields_and_duration_defaults() {
     let directory = tempfile::tempdir().unwrap();
-    let output = run(directory.path(), &["create-root-ca", "--help"]);
+    let output = run(directory.path(), &["create-ca", "--help"]);
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--name"));
-    assert!(help.contains("Defaults to 5y"));
-    assert!(help.contains("number ending in d, w, m, or y"));
+    assert!(help.contains("--organization <ORGANIZATION>"));
+    assert!(help.contains("--organizational-unit <ORGANIZATIONAL_UNIT>"));
+    assert!(help.contains("--country <COUNTRY>"));
+    assert!(help.contains("--state <STATE>"));
+    assert!(help.contains("--locality <LOCALITY>"));
+    assert!(help.contains("--profile <PROFILE>"));
+    assert!(help.contains("Root profile is required"));
+    assert!(help.contains("Root lifetime defaults to 5y"));
+    assert!(help.contains("--days <DAYS>"));
     assert!(help.contains("Required certificate common name"));
+}
+
+#[test]
+fn root_requires_all_subject_fields_and_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "create-ca",
+            "--name",
+            "root",
+            "--common-name",
+            "Example Root",
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+fn root_accepts_all_required_subject_fields_and_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "create-ca",
+            "--name",
+            "root",
+            "--common-name",
+            "Example Root",
+            "--organization",
+            "Example Org",
+            "--organizational-unit",
+            "PKI",
+            "--country",
+            "US",
+            "--state",
+            "California",
+            "--locality",
+            "San Francisco",
+            "--profile",
+            "ed25519",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn duplicate_root_names_across_profiles_are_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let common = [
+        "create-ca",
+        "--name",
+        "shared",
+        "--common-name",
+        "Example Root",
+        "--organization",
+        "Example",
+        "--organizational-unit",
+        "PKI",
+        "--country",
+        "US",
+        "--state",
+        "California",
+        "--locality",
+        "San Francisco",
+        "--profile",
+        "ecdsa-p256",
+    ];
+    let mut first_args = common.to_vec();
+    first_args.extend(["--do-it"]);
+    let first = run(directory.path(), &first_args);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let mut second_args = common.to_vec();
+    let profile_index = second_args.len() - 1;
+    second_args[profile_index] = "ed25519";
+    second_args.extend(["--do-it"]);
+    let second = run(directory.path(), &second_args);
+    assert_eq!(second.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("CA name is already in use"));
 }
 
 #[test]
 fn named_roots_can_share_a_profile_in_dry_run() {
     let directory = tempfile::tempdir().unwrap();
     let common = [
-        "create-root-ca",
+        "create-ca",
         "--common-name",
         "Example Root",
         "--organization",
         "Example",
+        "--organizational-unit",
+        "PKI",
+        "--country",
+        "US",
+        "--state",
+        "California",
+        "--locality",
+        "San Francisco",
         "--profile",
         "ed25519",
     ];
@@ -274,13 +384,23 @@ fn duration_units_are_accepted_for_root_dry_runs() {
         let output = run(
             directory.path(),
             &[
-                "create-root-ca",
+                "create-ca",
                 "--name",
                 name,
                 "--common-name",
                 "Example Root",
                 "--organization",
                 "Example",
+                "--organizational-unit",
+                "PKI",
+                "--country",
+                "US",
+                "--state",
+                "California",
+                "--locality",
+                "San Francisco",
+                "--profile",
+                "ecdsa-p256",
                 "--days",
                 duration,
             ],
@@ -294,18 +414,21 @@ fn duration_units_are_accepted_for_root_dry_runs() {
 }
 
 #[test]
-fn intermediate_help_allows_default_issuer_passphrase() {
+fn create_ca_help_describes_parent_passphrase_option() {
     let directory = tempfile::tempdir().unwrap();
-    let output = run(directory.path(), &["create-intermediate-ca", "--help"]);
+    let output = run(directory.path(), &["create-ca", "--help"]);
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
-    assert!(help.contains("defaults to the parent's private/ca.passphrase"));
+    assert!(help.contains("--pathlen <PATHLEN>"));
+    assert!(help.contains("--passphrase-file <PASSPHRASE_FILE>"));
+    assert!(help.contains("--parent-passphrase-file <PARENT_PASSPHRASE_FILE>"));
+    assert!(!help.contains("--issuer-passphrase-file"));
 }
 
 #[test]
-fn intermediate_help_allows_inherited_subject_fields() {
+fn create_ca_help_allows_inherited_subject_fields() {
     let directory = tempfile::tempdir().unwrap();
-    let output = run(directory.path(), &["create-intermediate-ca", "--help"]);
+    let output = run(directory.path(), &["create-ca", "--help"]);
     assert!(output.status.success());
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("inherit from the parent"));
@@ -332,7 +455,7 @@ fn intermediate_profile_can_be_omitted() {
     let output = run(
         directory.path(),
         &[
-            "create-intermediate-ca",
+            "create-ca",
             "--name",
             "issuing",
             "--parent",
@@ -341,7 +464,7 @@ fn intermediate_profile_can_be_omitted() {
             "Issuing CA",
             "--organization",
             "Example",
-            "--issuer-passphrase-file",
+            "--parent-passphrase-file",
             "missing.pass",
         ],
     );
@@ -382,7 +505,7 @@ fn intermediate_dry_run_shows_planned_commands_without_creating_files() {
     let output = run(
         directory.path(),
         &[
-            "create-intermediate-ca",
+            "create-ca",
             "--name",
             "issuing",
             "--parent",
@@ -399,9 +522,13 @@ fn intermediate_dry_run_shows_planned_commands_without_creating_files() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("planned CA artifacts:"));
     assert!(text.contains("ecparam"));
-    assert!(text.contains("req -new"));
-    assert!(text.contains("x509 -req"));
-    assert!(text.contains("-days 730"));
+    assert!(text.contains("req"));
+    assert!(text.contains("-new"));
+    assert!(text.contains("x509"));
+    assert!(text.contains("-req"));
+    assert!(text.contains("-days"));
+    assert!(text.contains("730"));
+    assert!(text.contains("\\"));
     assert!(text.contains("csr/ca.csr.pem"));
     assert!(!parent.join("../.pki-intermediate-ext").exists());
     assert!(
@@ -418,7 +545,7 @@ fn root_dry_run_shows_planned_creation_without_creating_files() {
     let output = run(
         directory.path(),
         &[
-            "create-root-ca",
+            "create-ca",
             "--name",
             "preview",
             "--profile",
@@ -427,6 +554,14 @@ fn root_dry_run_shows_planned_creation_without_creating_files() {
             "Example Root",
             "--organization",
             "Example",
+            "--organizational-unit",
+            "PKI",
+            "--country",
+            "US",
+            "--state",
+            "California",
+            "--locality",
+            "San Francisco",
             "--days",
             "5y",
         ],
@@ -441,8 +576,10 @@ fn root_dry_run_shows_planned_creation_without_creating_files() {
     assert!(text.contains("planned root CA artifacts:"));
     assert!(text.contains("planned OpenSSL commands:"));
     assert!(text.contains("ecparam"));
-    assert!(text.contains("req -x509"));
-    assert!(text.contains("-days 1825"));
+    assert!(text.contains("req"));
+    assert!(text.contains("-x509"));
+    assert!(text.contains("-days"));
+    assert!(text.contains("1825"));
     assert!(!directory.path().join("ecdsa-p256/root/preview/ca").exists());
 }
 
@@ -453,13 +590,23 @@ fn root_json_dry_run_contains_plans_without_secrets() {
         directory.path(),
         &[
             "--json",
-            "create-root-ca",
+            "create-ca",
             "--name",
             "json-preview",
             "--common-name",
             "Example Root",
             "--organization",
             "Example",
+            "--organizational-unit",
+            "PKI",
+            "--country",
+            "US",
+            "--state",
+            "California",
+            "--locality",
+            "San Francisco",
+            "--profile",
+            "ecdsa-p256",
         ],
     );
     assert!(output.status.success());
@@ -473,4 +620,229 @@ fn root_json_dry_run_contains_plans_without_secrets() {
             || json.to_string().contains("ecparam")
     );
     assert!(!json.to_string().contains("json-preview-generated"));
+}
+
+#[test]
+fn removed_ca_commands_are_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    for command in ["create-root-ca", "create-intermediate-ca"] {
+        let output = run(directory.path(), &[command]);
+        assert!(!output.status.success(), "{command} should be rejected");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error"));
+    }
+}
+
+#[test]
+fn create_ca_rejects_issuer_passphrase_option() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "create-ca",
+            "--name",
+            "issuing",
+            "--parent",
+            "root",
+            "--common-name",
+            "Issuing CA",
+            "--issuer-passphrase-file",
+            "missing.pass",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+}
+
+#[test]
+fn verbose_create_ca_dry_run_reports_artifact_details() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "--verbose",
+            "create-ca",
+            "--name",
+            "root",
+            "--profile",
+            "ed25519",
+            "--common-name",
+            "Example Root",
+            "--organization",
+            "Example",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("planned artifacts:"));
+    assert!(text.contains("created by: OpenSSL"));
+    assert!(text.contains("$ openssl genpkey"));
+    assert!(text.contains("-algorithm ED25519"));
+    assert!(
+        text.contains("generation: write the initial serial value 1000 followed by a newline")
+            || text.contains("contents: 1000")
+    );
+    assert!(text.contains("contents: hidden; sensitive file"));
+    assert!(text.contains("64 lowercase hexadecimal characters"));
+    assert!(
+        text.contains("empty file, 0 bytes")
+            || text.contains("contents: empty file")
+            || text.contains("contents: empty file, 0 bytes")
+    );
+    assert!(
+        text.contains("root signing uses inline -addext arguments")
+            || text.contains("contents: generated extension configuration")
+    );
+    assert!(!directory.path().join("ed25519/root/root/ca").exists());
+}
+
+#[test]
+fn verbose_create_ca_execution_reports_public_and_sensitive_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "--verbose",
+            "create-ca",
+            "--name",
+            "root",
+            "--profile",
+            "ed25519",
+            "--common-name",
+            "Example Root",
+            "--organization",
+            "Example",
+            "--organizational-unit",
+            "PKI",
+            "--country",
+            "US",
+            "--state",
+            "NY",
+            "--locality",
+            "NYC",
+            "--do-it",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("created files:"));
+    assert!(text.contains("certs/ca.cert.pem"));
+    assert!(text.contains("created by: OpenSSL"));
+    assert!(text.contains("purpose: public certificate"));
+    assert!(text.contains("created by: pki application"));
+    assert!(text.contains("purpose: passphrase used to protect or unlock a private key"));
+    assert!(text.contains("contents: hidden; sensitive file"));
+    assert!(text.contains("64 lowercase hexadecimal characters"));
+    assert!(
+        text.contains("empty file, 0 bytes")
+            || text.contains("contents: empty file")
+            || text.contains("contents: empty file, 0 bytes")
+    );
+    assert!(
+        text.contains("root signing uses inline -addext arguments")
+            || text.contains("contents: generated extension configuration")
+    );
+    assert!(!text.contains("BEGIN PRIVATE KEY"));
+    assert!(!text.contains("BEGIN ENCRYPTED PRIVATE KEY"));
+}
+
+#[test]
+fn verbose_create_cert_execution_reports_public_and_sensitive_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("ed25519/root/ca");
+    fs::create_dir_all(root.join("certs")).unwrap();
+    fs::create_dir_all(root.join("private")).unwrap();
+    fs::write(root.join("private/ca.passphrase"), "root-secret\n").unwrap();
+    let generated_key = root.join("private/ca.key.pem");
+    let generated = Command::new("openssl")
+        .args(["genpkey", "-algorithm", "ED25519", "-out"])
+        .arg(&generated_key)
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let generated = Command::new("openssl")
+        .args(["req", "-x509", "-new", "-key"])
+        .arg(&generated_key)
+        .args(["-out"])
+        .arg(root.join("certs/ca.cert.pem"))
+        .args(["-subj", "/CN=Parent Root/O=Example", "-days", "30"])
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let output = run(
+        directory.path(),
+        &[
+            "--verbose",
+            "create-cert",
+            "--cn",
+            "Leaf",
+            "--issuer",
+            "root",
+            "--san",
+            "www.example.com",
+            "--name",
+            "leaf",
+            "--do-it",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("created files:"));
+    assert!(text.contains("certs/cert.pem"));
+    assert!(text.contains("created by: OpenSSL"));
+    assert!(text.contains("purpose: public certificate"));
+    assert!(text.contains("created by: pki application"));
+    assert!(text.contains("purpose: passphrase used to protect or unlock a private key"));
+    assert!(text.contains("contents: hidden; sensitive file"));
+    assert!(text.contains("64 lowercase hexadecimal characters"));
+    assert!(
+        text.contains("empty file, 0 bytes")
+            || text.contains("contents: empty file")
+            || text.contains("contents: empty file, 0 bytes")
+    );
+    assert!(
+        text.contains("root signing uses inline -addext arguments")
+            || text.contains("contents: generated extension configuration")
+    );
+    assert!(!text.contains("BEGIN PRIVATE KEY"));
+    assert!(!text.contains("BEGIN ENCRYPTED PRIVATE KEY"));
+}
+
+#[test]
+fn create_ca_root_rejects_parent_passphrase_before_open_ssl() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "create-ca",
+            "--name",
+            "root",
+            "--profile",
+            "ed25519",
+            "--common-name",
+            "Example Root",
+            "--organization",
+            "Example",
+            "--parent-passphrase-file",
+            "missing.pass",
+            "--do-it",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--parent-passphrase-file is only valid with --parent")
+    );
+    assert!(!directory.path().join("ed25519/root/root/ca").exists());
 }

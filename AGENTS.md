@@ -23,13 +23,11 @@ This is a rust project to manage my offline PKI. It is a openssl wrapper for me 
 
 ./pki --dir <offline pki directory, e.g. /Volumes/gywadmin-homelab/pki>
 
-### Create Root CA
+### Create CA
 
-./pki create-root-ca
+./pki create-ca
 
-### Create Intermediate CA
-
-./pki create-intermediate-ca
+Use `--parent <selector>` with `create-ca` to create an intermediate CA. Omit `--parent` to create a root CA.
 
 ### Create Certificate
 
