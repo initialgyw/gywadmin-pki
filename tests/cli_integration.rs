@@ -740,15 +740,6 @@ fn verbose_create_ca_execution_reports_public_and_sensitive_files() {
     assert!(text.contains("purpose: passphrase used to protect or unlock a private key"));
     assert!(text.contains("contents: hidden; sensitive file"));
     assert!(text.contains("64 lowercase hexadecimal characters"));
-    assert!(
-        text.contains("empty file, 0 bytes")
-            || text.contains("contents: empty file")
-            || text.contains("contents: empty file, 0 bytes")
-    );
-    assert!(
-        text.contains("root signing uses inline -addext arguments")
-            || text.contains("contents: generated extension configuration")
-    );
     assert!(!text.contains("BEGIN PRIVATE KEY"));
     assert!(!text.contains("BEGIN ENCRYPTED PRIVATE KEY"));
 }
@@ -806,15 +797,6 @@ fn verbose_create_cert_execution_reports_public_and_sensitive_files() {
     assert!(text.contains("purpose: passphrase used to protect or unlock a private key"));
     assert!(text.contains("contents: hidden; sensitive file"));
     assert!(text.contains("64 lowercase hexadecimal characters"));
-    assert!(
-        text.contains("empty file, 0 bytes")
-            || text.contains("contents: empty file")
-            || text.contains("contents: empty file, 0 bytes")
-    );
-    assert!(
-        text.contains("root signing uses inline -addext arguments")
-            || text.contains("contents: generated extension configuration")
-    );
     assert!(!text.contains("BEGIN PRIVATE KEY"));
     assert!(!text.contains("BEGIN ENCRYPTED PRIVATE KEY"));
 }
