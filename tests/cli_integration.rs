@@ -124,7 +124,7 @@ fn human_list_indents_intermediates_and_leaves() {
     let output = run(directory.path(), &["list"]);
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("root (root_ca)"));
+    assert!(text.contains("root — Root"));
 }
 
 #[test]
@@ -151,14 +151,93 @@ fn list_json_output_is_explicit_and_includes_name_fields() {
 }
 
 #[test]
-fn check_succeeds() {
+fn check_requires_a_certificate_name() {
     let directory = tempfile::tempdir().unwrap();
     let output = run(directory.path(), &["check"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--name <NAME>"));
+}
+
+#[test]
+fn check_human_output_includes_key_usage_without_technical_details() {
+    let directory = tempfile::tempdir().unwrap();
+    let certificate_directory = directory.path().join("ed25519/certs/service/certs");
+    fs::create_dir_all(&certificate_directory).unwrap();
+    let certificate = certificate_directory.join("cert.pem");
+    let generated = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "ed25519", "-nodes", "-keyout"])
+        .arg(directory.path().join("key.pem"))
+        .args(["-out"])
+        .arg(&certificate)
+        .args([
+            "-subj",
+            "/CN=service.example",
+            "-addext",
+            "keyUsage=critical,digitalSignature",
+            "-days",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let inspected = Command::new("openssl")
+        .args(["x509", "-in"])
+        .arg(&certificate)
+        .args(["-noout", "-ext", "keyUsage"])
+        .output()
+        .unwrap();
+    assert!(inspected.status.success());
+    assert!(String::from_utf8_lossy(&inspected.stdout).contains("Digital Signature"));
+    let output = run(directory.path(), &["check", "--name", "service"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("key usage:"));
+    assert!(text.contains("Digital Signature"));
+    assert!(!text.contains("key usage: <none>"));
+    assert!(!text.contains("fingerprint:"));
+    assert!(!text.contains("signature:"));
+    assert!(!text.contains("technical metadata:"));
+}
+
+#[test]
+fn root_full_chain_keeps_key_usage_in_human_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let certificate_directory = directory.path().join("ed25519/root/root/ca/certs");
+    fs::create_dir_all(&certificate_directory).unwrap();
+    let certificate = certificate_directory.join("ca.cert.pem");
+    let generated = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "ed25519", "-nodes", "-keyout"])
+        .arg(directory.path().join("key.pem"))
+        .args(["-out"])
+        .arg(&certificate)
+        .args([
+            "-subj",
+            "/CN=Root",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+            "-days",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    assert!(generated.status.success());
+    let output = run(
+        directory.path(),
+        &["check", "--include-full-chain", "--name", "root"],
+    );
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("key usage:"));
+    assert!(!text.contains("key usage: <none>"));
+    assert!(text.contains("full chain:"));
 }
 
 #[test]

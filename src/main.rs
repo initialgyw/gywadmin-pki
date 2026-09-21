@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use time::OffsetDateTime;
-use x509_parser::extensions::GeneralName;
+use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::pem::parse_x509_pem;
+use x509_parser::prelude::X509Certificate;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Report {
@@ -24,6 +25,7 @@ struct Report {
     planned_commands: Vec<Vec<String>>,
     planned_artifacts: Vec<String>,
     certificates: Option<Vec<CertificateRecord>>,
+    check: Option<CertificateCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +51,64 @@ struct CertificateRecord {
     issuer: String,
     subject: String,
     domains: Vec<String>,
+    certificate_id: String,
+    parent_id: Option<String>,
+    relationship: String,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CertificateCheck {
+    schema_version: u8,
+    name: String,
+    path: String,
+    kind: String,
+    profile: Option<String>,
+    subject: String,
+    sans: Vec<SanEntry>,
+    issuer: String,
+    validity: ValidityPeriod,
+    public_key: PublicKeyInfo,
+    fingerprint: Fingerprint,
+    signature: SignatureInfo,
+    technical_metadata: TechnicalMetadata,
+    key_usage: Vec<String>,
+    full_chain: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SanEntry {
+    kind: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidityPeriod {
+    not_before: String,
+    not_after: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PublicKeyInfo {
+    algorithm: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Fingerprint {
+    digest: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SignatureInfo {
+    algorithm: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TechnicalMetadata {
+    version: u8,
+    serial: String,
+    extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -434,9 +494,17 @@ struct Cli {
     command: Operation,
 }
 
+#[derive(Debug, Clone, Args)]
+struct CheckArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    include_full_chain: bool,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 enum Operation {
-    Check,
+    Check(CheckArgs),
     CreateCa(CreateCaArgs),
     CreateCert(CertArgs),
     List,
@@ -523,10 +591,28 @@ fn main() {
                         print_planned_provenance(&report);
                     }
                 }
-                print_planned_root(&report);
-                println!("ok: {}", report.message);
-                for path in report.paths {
-                    println!("{path}");
+                if let Some(check) = report.check.as_ref() {
+                    println!("ok: {}", report.message);
+                    println!("name: {}", check.name);
+                    println!("subject: {}", check.subject);
+                    println!("san: {}", format_sans(&check.sans));
+                    println!("issuer: {}", check.issuer);
+                    println!(
+                        "validity: {} to {}",
+                        check.validity.not_before, check.validity.not_after
+                    );
+                    println!("public key: {}", check.public_key.algorithm);
+                    println!("key usage: {}", format_key_usage(&check.key_usage));
+                    if let Some(full_chain) = check.full_chain.as_ref() {
+                        println!("full chain:");
+                        print!("{full_chain}");
+                    }
+                } else {
+                    print_planned_root(&report);
+                    println!("ok: {}", report.message);
+                    for path in report.paths {
+                        println!("{path}");
+                    }
                 }
             }
         }
@@ -543,6 +629,7 @@ fn main() {
                 planned_commands: Vec::new(),
                 planned_artifacts: Vec::new(),
                 certificates: None,
+                check: None,
             };
             if json {
                 eprintln!("{}", serde_json::to_string(&report).unwrap());
@@ -570,11 +657,13 @@ fn execute(cli: &Cli, openssl: &mut OpenSsl) -> Result<Report, (u8, String)> {
             "--parent-passphrase-file is only valid with --parent".into(),
         ));
     }
-    openssl
-        .run(&["version".into()])
-        .map_err(|error| (8, error))?;
+    if !matches!(cli.command, Operation::Check(_)) {
+        openssl
+            .run(&["version".into()])
+            .map_err(|error| (8, error))?;
+    }
     match &cli.command {
-        Operation::Check => Ok(success("OpenSSL verified", true)),
+        Operation::Check(args) => check_certificate(&cli.dir, openssl, args),
         Operation::CreateCa(args) => {
             if let Some(parent) = &args.parent {
                 let intermediate = IntermediateArgs {
@@ -631,6 +720,7 @@ fn success(message: &str, dry_run: bool) -> Report {
         planned_commands: Vec::new(),
         planned_artifacts: Vec::new(),
         certificates: None,
+        check: None,
     }
 }
 
@@ -2000,6 +2090,113 @@ fn relative_path(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+fn check_certificate(
+    dir: &Path,
+    openssl: &mut OpenSsl,
+    args: &CheckArgs,
+) -> Result<Report, (u8, String)> {
+    let mut paths = Vec::new();
+    collect_certificates(dir, dir, &mut paths).map_err(|error| (6, error))?;
+    let matches: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| {
+            classify_certificate_path(&relative_path(dir, path))
+                .0
+                .as_deref()
+                == Some(args.name.as_str())
+        })
+        .collect();
+    let path = match matches.as_slice() {
+        [] => return Err((11, format!("certificate name not found: {}", args.name))),
+        [path] => path,
+        _ => return Err((11, format!("certificate name is ambiguous: {}", args.name))),
+    };
+    let record = parse_certificate(path, dir).map_err(|error| (11, error))?;
+    if args.include_full_chain && record.kind == "root_ca" {
+        let certificate = parse_x509_certificate(path).map_err(|error| (11, error))?;
+        let fingerprint = openssl
+            .run(&[
+                "x509".into(),
+                "-sha256".into(),
+                "-in".into(),
+                path.display().to_string(),
+                "-noout".into(),
+                "-fingerprint".into(),
+            ])
+            .map_err(|error| (10, error))?;
+        let key_usage_output = openssl
+            .run(&[
+                "x509".into(),
+                "-in".into(),
+                path.display().to_string(),
+                "-noout".into(),
+                "-ext".into(),
+                "keyUsage".into(),
+            ])
+            .map_err(|error| (10, error))?;
+        let mut report = success(&format!("checked certificate {}", args.name), false);
+        report.paths.push(record.path.clone());
+        report.check = Some(build_certificate_check(
+            &record,
+            &certificate,
+            &String::from_utf8_lossy(&fingerprint),
+            "",
+            &String::from_utf8_lossy(&key_usage_output),
+        )?);
+        if let Some(check) = report.check.as_mut() {
+            check.full_chain =
+                Some(fs::read_to_string(path).map_err(|error| (11, error.to_string()))?);
+        }
+        return Ok(report);
+    }
+    let certificate = parse_x509_certificate(path).map_err(|error| (11, error))?;
+    let fingerprint = openssl
+        .run(&[
+            "x509".into(),
+            "-sha256".into(),
+            "-in".into(),
+            path.display().to_string(),
+            "-noout".into(),
+            "-fingerprint".into(),
+        ])
+        .map_err(|error| (10, error))?;
+    let metadata = openssl
+        .run(&[
+            "x509".into(),
+            "-in".into(),
+            path.display().to_string(),
+            "-noout".into(),
+            "-subject".into(),
+            "-issuer".into(),
+            "-serial".into(),
+            "-dates".into(),
+            "-ext".into(),
+            "subjectAltName".into(),
+            "-text".into(),
+        ])
+        .map_err(|error| (10, error))?;
+    let key_usage_output = openssl
+        .run(&[
+            "x509".into(),
+            "-in".into(),
+            path.display().to_string(),
+            "-noout".into(),
+            "-ext".into(),
+            "keyUsage".into(),
+        ])
+        .map_err(|error| (10, error))?;
+    let mut report = success(&format!("checked certificate {}", args.name), false);
+    report.paths.push(record.path.clone());
+    report.check = Some(build_certificate_check(
+        &record,
+        &certificate,
+        &String::from_utf8_lossy(&fingerprint),
+        &String::from_utf8_lossy(&metadata),
+        &String::from_utf8_lossy(&key_usage_output),
+    )?);
+    Ok(report)
+}
+
 fn list_certificates(
     dir: &Path,
     openssl: &mut OpenSsl,
@@ -2009,6 +2206,7 @@ fn list_certificates(
     collect_certificates(dir, dir, &mut paths).map_err(|error| (6, error))?;
     paths.sort();
     let mut records = Vec::new();
+    let mut parse_errors = Vec::new();
     for path in paths {
         if verbose {
             let args = vec![
@@ -2025,15 +2223,18 @@ fn list_certificates(
             ];
             openssl.run(&args).map_err(|error| (10, error))?;
         }
-        if let Ok(record) = parse_certificate(&path, dir) {
-            records.push(record);
+        match parse_certificate(&path, dir) {
+            Ok(record) => records.push(record),
+            Err(error) => parse_errors.push(format!("{}: {error}", relative_path(dir, &path))),
         }
     }
-    if !verbose {
-        let _ = openssl
-            .run(&["x509".into(), "-help".into()])
-            .map_err(|error| (10, error))?;
+    if !parse_errors.is_empty() {
+        return Err((
+            11,
+            format!("certificate parse failure(s): {}", parse_errors.join("; ")),
+        ));
     }
+    assign_relationships(&mut records);
     records.sort_by(|a, b| a.subject.cmp(&b.subject).then(a.path.cmp(&b.path)));
     let mut report = success(&format!("listed {} certificate(s)", records.len()), true);
     report.certificates = Some(records);
@@ -2071,6 +2272,189 @@ fn collect_certificates(
         }
     }
     Ok(())
+}
+
+fn parse_x509_certificate(path: &Path) -> Result<X509Certificate<'static>, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+    let (_, pem) = parse_x509_pem(leaked).map_err(|_| "not PEM".to_owned())?;
+    let certificate = pem.parse_x509().map_err(|_| "not X.509".to_owned())?;
+    let certificate = unsafe {
+        std::mem::transmute::<X509Certificate<'_>, X509Certificate<'static>>(certificate)
+    };
+    Ok(certificate)
+}
+
+fn format_sans(sans: &[SanEntry]) -> String {
+    if sans.is_empty() {
+        "<none>".into()
+    } else {
+        sans.iter()
+            .map(|san| format!("{}:{}", san.kind, san.value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn format_key_usage(usages: &[String]) -> String {
+    if usages.is_empty() {
+        "<none>".into()
+    } else {
+        usages.join(", ")
+    }
+}
+
+fn build_certificate_check(
+    record: &CertificateRecord,
+    certificate: &X509Certificate<'_>,
+    fingerprint_output: &str,
+    _metadata_output: &str,
+    key_usage_output: &str,
+) -> Result<CertificateCheck, (u8, String)> {
+    let sans = certificate
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|san| {
+            san.value
+                .general_names
+                .iter()
+                .map(|name| match name {
+                    GeneralName::DNSName(value) => SanEntry {
+                        kind: "dns".into(),
+                        value: (*value).into(),
+                    },
+                    GeneralName::IPAddress(value) => SanEntry {
+                        kind: "ip".into(),
+                        value: format_ip(value),
+                    },
+                    GeneralName::RFC822Name(value) => SanEntry {
+                        kind: "email".into(),
+                        value: (*value).into(),
+                    },
+                    GeneralName::URI(value) => SanEntry {
+                        kind: "uri".into(),
+                        value: (*value).into(),
+                    },
+                    other => SanEntry {
+                        kind: "other".into(),
+                        value: other.to_string(),
+                    },
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let fingerprint = fingerprint_output
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("sha256 Fingerprint=")
+                .or_else(|| line.strip_prefix("SHA256 Fingerprint="))
+        })
+        .ok_or((11, "OpenSSL fingerprint output was incomplete".into()))?;
+    let serial = certificate.raw_serial_as_string();
+    let key_usage = key_usage_from_extensions(certificate)?;
+    let key_usage = if key_usage.is_empty() {
+        parse_openssl_key_usage(key_usage_output)
+    } else {
+        key_usage
+    };
+    let extensions = certificate
+        .extensions()
+        .iter()
+        .map(|extension| extension.oid.to_string())
+        .collect();
+    Ok(CertificateCheck {
+        schema_version: 1,
+        name: record
+            .name
+            .clone()
+            .ok_or((11, "certificate has no application name".into()))?,
+        path: record.path.clone(),
+        kind: record.kind.clone(),
+        profile: record.profile.clone(),
+        subject: record.subject.clone(),
+        sans,
+        issuer: record.issuer.clone(),
+        validity: ValidityPeriod {
+            not_before: format_timestamp(certificate.validity().not_before.timestamp()),
+            not_after: format_timestamp(certificate.validity().not_after.timestamp()),
+        },
+        public_key: PublicKeyInfo {
+            algorithm: record.algorithm.clone(),
+        },
+        fingerprint: Fingerprint {
+            digest: "sha256".into(),
+            value: fingerprint.into(),
+        },
+        signature: SignatureInfo {
+            algorithm: certificate.signature_algorithm.algorithm.to_string(),
+        },
+        technical_metadata: TechnicalMetadata {
+            version: certificate.version().0 as u8 + 1,
+            serial,
+            extensions,
+        },
+        key_usage,
+        full_chain: None,
+    })
+}
+
+fn parse_openssl_key_usage(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .skip_while(|line| !line.contains("Key Usage"))
+        .skip(1)
+        .flat_map(|line| line.trim().split(","))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn key_usage_from_extensions(
+    certificate: &X509Certificate<'_>,
+) -> Result<Vec<String>, (u8, String)> {
+    let extension = certificate
+        .extensions()
+        .iter()
+        .find(|extension| extension.oid.to_string() == "2.5.29.15");
+    let Some(extension) = extension else {
+        return Ok(Vec::new());
+    };
+    let ParsedExtension::KeyUsage(usage) = extension.parsed_extension() else {
+        return Err((11, "key usage extension could not be decoded".into()));
+    };
+    let names = [
+        (usage.digital_signature(), "Digital Signature"),
+        (usage.non_repudiation(), "Non Repudiation"),
+        (usage.key_encipherment(), "Key Encipherment"),
+        (usage.data_encipherment(), "Data Encipherment"),
+        (usage.key_agreement(), "Key Agreement"),
+        (usage.key_cert_sign(), "Key Cert Sign"),
+        (usage.crl_sign(), "CRL Sign"),
+        (usage.encipher_only(), "Encipher Only"),
+        (usage.decipher_only(), "Decipher Only"),
+    ];
+    Ok(names
+        .into_iter()
+        .filter_map(|(enabled, name)| enabled.then_some(name.to_owned()))
+        .collect())
+}
+
+fn format_ip(value: &[u8]) -> String {
+    match value.len() {
+        4 => std::net::Ipv4Addr::new(value[0], value[1], value[2], value[3]).to_string(),
+        16 => {
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(value);
+            std::net::Ipv6Addr::from(bytes).to_string()
+        }
+        _ => value
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    }
 }
 
 fn parse_certificate(path: &Path, root: &Path) -> Result<CertificateRecord, String> {
@@ -2113,6 +2497,10 @@ fn parse_certificate(path: &Path, root: &Path) -> Result<CertificateRecord, Stri
         issuer,
         subject,
         domains,
+        certificate_id: String::new(),
+        parent_id: None,
+        relationship: "unresolved_issuer".into(),
+        warnings: Vec::new(),
     })
 }
 
@@ -2241,11 +2629,68 @@ fn format_timestamp(timestamp: i64) -> String {
 /// # Errors
 ///
 /// This function does not perform fallible I/O and therefore returns no errors.
+fn assign_relationships(records: &mut [CertificateRecord]) {
+    let subjects: HashMap<(Option<String>, String), Vec<usize>> =
+        records
+            .iter()
+            .enumerate()
+            .fold(HashMap::new(), |mut index, (position, record)| {
+                index
+                    .entry((
+                        record.profile.clone(),
+                        record.subject.trim().to_ascii_lowercase(),
+                    ))
+                    .or_default()
+                    .push(position);
+                index
+            });
+    let kinds: Vec<String> = records.iter().map(|record| record.kind.clone()).collect();
+    let mut parent_for = HashMap::new();
+    for (index, record) in records.iter_mut().enumerate() {
+        record.certificate_id = format!("sha256:{}", index);
+        if record
+            .issuer
+            .trim()
+            .eq_ignore_ascii_case(record.subject.trim())
+        {
+            record.relationship = "root".into();
+            continue;
+        }
+        let candidates = subjects
+            .get(&(
+                record.profile.clone(),
+                record.issuer.trim().to_ascii_lowercase(),
+            ))
+            .cloned()
+            .unwrap_or_default();
+        if candidates.len() == 1 {
+            let parent = candidates[0];
+            parent_for.insert(index, parent);
+            let parent_is_ca = kinds[parent] == "root_ca" || kinds[parent] == "intermediate_ca";
+            record.parent_id = Some(format!("sha256:{parent}"));
+            record.relationship = "issued_by".into();
+            if !parent_is_ca {
+                record
+                    .warnings
+                    .push("issuer is not classified as a CA".into());
+            }
+        } else if candidates.len() > 1 {
+            record.relationship = "ambiguous_issuer".into();
+            record
+                .warnings
+                .push(format!("{} issuer candidates", candidates.len()));
+        } else {
+            record.relationship = "unresolved_issuer".into();
+        }
+    }
+    let _ = parent_for;
+}
+
 fn render_tree(records: &[CertificateRecord]) -> String {
-    let mut subjects: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut subjects: HashMap<(Option<String>, String), Vec<usize>> = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         subjects
-            .entry(record.subject.clone())
+            .entry((record.profile.clone(), record.subject.clone()))
             .or_default()
             .push(index);
     }
@@ -2257,7 +2702,7 @@ fn render_tree(records: &[CertificateRecord]) -> String {
             top_level.push(index);
             continue;
         }
-        match subjects.get(&record.issuer) {
+        match subjects.get(&(record.profile.clone(), record.issuer.clone())) {
             Some(parents) if parents.len() == 1 => {
                 children.entry(parents[0]).or_default().push(index);
             }
@@ -2312,10 +2757,9 @@ fn render_record_branch(
     let record = &records[index];
     let name = record.name.as_deref().unwrap_or("<unnamed>");
     lines.push(format!(
-        "{}{} ({}) — {} [{}] — expires {}",
+        "{}{} — {} [{}] — expires {}",
         "  ".repeat(depth),
         name,
-        record.kind,
         record.common_name,
         record.algorithm,
         record.expires
