@@ -278,6 +278,8 @@ fn cert_dry_run_shows_planned_commands() {
             "www.example.com",
             "--name",
             "leaf",
+            "--passphrase",
+            "NONE",
         ],
     );
     assert!(
@@ -307,7 +309,9 @@ fn cert_help_requires_issuer_and_describes_inheritance() {
     assert!(help.contains("--issuer"));
     assert!(!help.contains("--root"));
     assert!(help.contains("inherit the issuer profile"));
-    assert!(help.contains("secure random passphrase"));
+    assert!(help.contains("PROMPT"));
+    assert!(help.contains("NONE"));
+    assert!(help.contains("AUTO"));
 }
 
 #[test]
@@ -327,6 +331,137 @@ fn create_ca_help_describes_required_fields_and_duration_defaults() {
     assert!(help.contains("Root lifetime defaults to 5y"));
     assert!(help.contains("--days <DAYS>"));
     assert!(help.contains("Required certificate common name"));
+}
+
+#[test]
+fn create_ca_requires_exactly_one_passphrase_selector() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "create-ca",
+            "--name",
+            "root",
+            "--profile",
+            "ed25519",
+            "--common-name",
+            "Root",
+            "--organization",
+            "Example",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("exactly one of --passphrase or --passphrase-file is required")
+    );
+}
+
+#[test]
+fn root_none_does_not_create_a_passphrase_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "create-ca",
+            "--name",
+            "root",
+            "--profile",
+            "ed25519",
+            "--common-name",
+            "Root",
+            "--organization",
+            "Example",
+            "--passphrase",
+            "NONE",
+            "--do-it",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !directory
+            .path()
+            .join("ed25519/root/root/ca/private/ca.passphrase")
+            .exists()
+    );
+}
+
+#[test]
+fn root_literal_passphrase_is_saved_to_the_default_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "create-ca",
+            "--name",
+            "root",
+            "--profile",
+            "ed25519",
+            "--common-name",
+            "Root",
+            "--organization",
+            "Example",
+            "--passphrase",
+            "literal-secret",
+            "--do-it",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(
+            directory
+                .path()
+                .join("ed25519/root/root/ca/private/ca.passphrase")
+        )
+        .unwrap(),
+        "literal-secret\n"
+    );
+}
+
+#[test]
+fn root_auto_passphrase_is_saved_to_the_default_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(
+        directory.path(),
+        &[
+            "create-ca",
+            "--name",
+            "root",
+            "--profile",
+            "ed25519",
+            "--common-name",
+            "Root",
+            "--organization",
+            "Example",
+            "--passphrase-file",
+            "AUTO",
+            "--do-it",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(
+            directory
+                .path()
+                .join("ed25519/root/root/ca/private/ca.passphrase")
+        )
+        .unwrap()
+        .trim()
+        .len(),
+        64
+    );
 }
 
 #[test]
@@ -370,6 +505,8 @@ fn root_accepts_all_required_subject_fields_and_profile() {
             "San Francisco",
             "--profile",
             "ed25519",
+            "--passphrase-file",
+            "AUTO",
         ],
     );
     assert!(
@@ -400,6 +537,8 @@ fn duplicate_root_names_across_profiles_are_rejected() {
         "San Francisco",
         "--profile",
         "ecdsa-p256",
+        "--passphrase-file",
+        "AUTO",
     ];
     let mut first_args = common.to_vec();
     first_args.extend(["--do-it"]);
@@ -437,6 +576,8 @@ fn named_roots_can_share_a_profile_in_dry_run() {
         "San Francisco",
         "--profile",
         "ed25519",
+        "--passphrase-file",
+        "AUTO",
     ];
     let mut first = common.to_vec();
     first.extend(["--name", "first"]);
@@ -482,6 +623,8 @@ fn duration_units_are_accepted_for_root_dry_runs() {
                 "ecdsa-p256",
                 "--days",
                 duration,
+                "--passphrase-file",
+                "AUTO",
             ],
         );
         assert!(
@@ -545,6 +688,8 @@ fn intermediate_profile_can_be_omitted() {
             "Example",
             "--parent-passphrase-file",
             "missing.pass",
+            "--passphrase-file",
+            "AUTO",
         ],
     );
     let text = String::from_utf8_lossy(&output.stdout);
@@ -591,6 +736,8 @@ fn intermediate_dry_run_shows_planned_commands_without_creating_files() {
             "root",
             "--common-name",
             "Issuing CA",
+            "--passphrase-file",
+            "AUTO",
         ],
     );
     assert!(
@@ -643,6 +790,8 @@ fn root_dry_run_shows_planned_creation_without_creating_files() {
             "San Francisco",
             "--days",
             "5y",
+            "--passphrase-file",
+            "AUTO",
         ],
     );
     assert!(
@@ -686,6 +835,8 @@ fn root_json_dry_run_contains_plans_without_secrets() {
             "San Francisco",
             "--profile",
             "ecdsa-p256",
+            "--passphrase-file",
+            "AUTO",
         ],
     );
     assert!(output.status.success());
@@ -748,6 +899,8 @@ fn verbose_create_ca_dry_run_reports_artifact_details() {
             "Example Root",
             "--organization",
             "Example",
+            "--passphrase-file",
+            "AUTO",
         ],
     );
     assert!(
@@ -802,6 +955,8 @@ fn verbose_create_ca_execution_reports_public_and_sensitive_files() {
             "NY",
             "--locality",
             "NYC",
+            "--passphrase-file",
+            "AUTO",
             "--do-it",
         ],
     );
@@ -859,6 +1014,8 @@ fn verbose_create_cert_execution_reports_public_and_sensitive_files() {
             "www.example.com",
             "--name",
             "leaf",
+            "--passphrase",
+            "NONE",
             "--do-it",
         ],
     );
@@ -873,9 +1030,8 @@ fn verbose_create_cert_execution_reports_public_and_sensitive_files() {
     assert!(text.contains("created by: OpenSSL"));
     assert!(text.contains("purpose: public certificate"));
     assert!(text.contains("created by: pki application"));
-    assert!(text.contains("purpose: passphrase used to protect or unlock a private key"));
-    assert!(text.contains("contents: hidden; sensitive file"));
-    assert!(text.contains("64 lowercase hexadecimal characters"));
+    assert!(!text.contains("purpose: passphrase used to protect or unlock a private key"));
+    assert!(!text.contains("64 lowercase hexadecimal characters"));
     assert!(!text.contains("BEGIN PRIVATE KEY"));
     assert!(!text.contains("BEGIN ENCRYPTED PRIVATE KEY"));
 }
@@ -897,6 +1053,8 @@ fn create_ca_root_rejects_parent_passphrase_before_open_ssl() {
             "Example",
             "--parent-passphrase-file",
             "missing.pass",
+            "--passphrase-file",
+            "AUTO",
             "--do-it",
         ],
     );

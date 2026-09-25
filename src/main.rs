@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -247,9 +247,16 @@ struct CreateCaArgs {
     key_usage: Vec<KeyUsage>,
     #[arg(
         long,
-        help = "Passphrase file for the new CA key; omit to generate one during execution."
+        conflicts_with = "passphrase_file",
+        help = "Literal passphrase, PROMPT for a masked confirmation prompt, or NONE for an unencrypted key."
     )]
-    passphrase_file: Option<PathBuf>,
+    passphrase: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "passphrase",
+        help = "Existing passphrase file to copy, or AUTO to generate one. Exactly one passphrase option is required."
+    )]
+    passphrase_file: Option<String>,
     #[arg(
         long = "parent-passphrase-file",
         help = "Passphrase file for the existing parent CA key; defaults to the parent's private/ca.passphrase."
@@ -279,9 +286,16 @@ struct RootArgs {
     key_usage: Vec<KeyUsage>,
     #[arg(
         long,
-        help = "Optional existing passphrase file; otherwise one is generated during execution."
+        conflicts_with = "passphrase_file",
+        help = "Literal passphrase, PROMPT for a masked confirmation prompt, or NONE for an unencrypted key."
     )]
-    passphrase_file: Option<PathBuf>,
+    passphrase: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "passphrase",
+        help = "Existing passphrase file to copy, or AUTO to generate one. Exactly one passphrase option is required."
+    )]
+    passphrase_file: Option<String>,
     #[arg(
         long,
         help = "Execute the operation. Without this flag, only validation is performed."
@@ -318,9 +332,16 @@ struct IntermediateArgs {
     key_usage: Vec<KeyUsage>,
     #[arg(
         long,
-        help = "Optional existing passphrase file; otherwise one is generated during execution."
+        conflicts_with = "passphrase_file",
+        help = "Literal passphrase, PROMPT for a masked confirmation prompt, or NONE for an unencrypted key."
     )]
-    passphrase_file: Option<PathBuf>,
+    passphrase: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "passphrase",
+        help = "Existing passphrase file to copy, or AUTO to generate one. Exactly one passphrase option is required."
+    )]
+    passphrase_file: Option<String>,
     #[arg(
         long,
         help = "Optional parent passphrase file; defaults to the parent's private/ca.passphrase."
@@ -372,9 +393,16 @@ struct CertArgs {
     ip: Vec<String>,
     #[arg(
         long,
-        help = "Optional leaf passphrase file; otherwise generate a secure random passphrase."
+        conflicts_with = "passphrase_file",
+        help = "Literal passphrase, PROMPT for a masked confirmation prompt, or NONE for an unencrypted key."
     )]
-    passphrase_file: Option<PathBuf>,
+    passphrase: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "passphrase",
+        help = "Existing passphrase file to copy, or AUTO to generate one. Exactly one passphrase option is required."
+    )]
+    passphrase_file: Option<String>,
     #[arg(
         long,
         help = "Optional issuer passphrase file; defaults to the issuer's private/ca.passphrase."
@@ -385,6 +413,12 @@ struct CertArgs {
         help = "Execute the operation. Without this flag, only validation is performed."
     )]
     do_it: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum PassphrasePolicy {
+    Encrypted(PathBuf),
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,6 +676,7 @@ fn main() {
 }
 
 fn execute(cli: &Cli, openssl: &mut OpenSsl) -> Result<Report, (u8, String)> {
+    validate_passphrase_options(&cli.command)?;
     if !cfg!(unix) {
         return Err((15, "pki is Unix-only".into()));
     }
@@ -677,6 +712,7 @@ fn execute(cli: &Cli, openssl: &mut OpenSsl) -> Result<Report, (u8, String)> {
                         .unwrap_or_else(|| "2y".parse().expect("static duration")),
                     pathlen: args.pathlen,
                     key_usage: args.key_usage.clone(),
+                    passphrase: args.passphrase.clone(),
                     passphrase_file: args.passphrase_file.clone(),
                     issuer_passphrase_file: args.parent_passphrase_file.clone(),
                     do_it: args.do_it,
@@ -696,6 +732,7 @@ fn execute(cli: &Cli, openssl: &mut OpenSsl) -> Result<Report, (u8, String)> {
                         .unwrap_or_else(|| "5y".parse().expect("static duration")),
                     pathlen: args.pathlen,
                     key_usage: args.key_usage.clone(),
+                    passphrase: args.passphrase.clone(),
                     passphrase_file: args.passphrase_file.clone(),
                     do_it: args.do_it,
                 };
@@ -705,6 +742,21 @@ fn execute(cli: &Cli, openssl: &mut OpenSsl) -> Result<Report, (u8, String)> {
         Operation::List => list_certificates(&cli.dir, openssl, cli.verbose),
         Operation::CreateCert(args) => create_certificate(&cli.dir, openssl, args),
     }
+}
+
+fn validate_passphrase_options(command: &Operation) -> Result<(), (u8, String)> {
+    let (passphrase, passphrase_file) = match command {
+        Operation::CreateCa(args) => (&args.passphrase, &args.passphrase_file),
+        Operation::CreateCert(args) => (&args.passphrase, &args.passphrase_file),
+        _ => return Ok(()),
+    };
+    if passphrase.is_some() == passphrase_file.is_some() {
+        return Err((
+            4,
+            "exactly one of --passphrase or --passphrase-file is required".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn success(message: &str, dry_run: bool) -> Report {
@@ -744,7 +796,11 @@ fn create_root(dir: &Path, openssl: &mut OpenSsl, args: &RootArgs) -> Result<Rep
     let ext = target.join("config/ca.ext");
     validate_key_usages(&args.key_usage, true)?;
     let planned_commands = root_command_plan(args, &key, &cert, days);
-    let planned_artifacts = root_artifact_plan(dir, &target, args.passphrase_file.is_none());
+    let planned_artifacts = root_artifact_plan(
+        dir,
+        &target,
+        !matches!(args.passphrase.as_deref(), Some("NONE")),
+    );
     if !args.do_it {
         let mut report = success_with_path(
             &format!("dry-run: root CA would be created for {days} days"),
@@ -759,7 +815,13 @@ fn create_root(dir: &Path, openssl: &mut OpenSsl, args: &RootArgs) -> Result<Rep
     fs::create_dir_all(target.join("certs")).map_err(fs_error)?;
     fs::create_dir_all(target.join("newcerts")).map_err(fs_error)?;
     fs::create_dir_all(target.join("config")).map_err(fs_error)?;
-    let pass = passphrase(args.passphrase_file.as_deref(), dir, &target, openssl)?;
+    let pass = resolve_passphrase(
+        args.passphrase.as_deref(),
+        args.passphrase_file.as_deref(),
+        dir,
+        &target,
+        true,
+    )?;
     generate_key(openssl, &args.profile, &key, &pass)?;
     write_new(&ext, &format!("basicConstraints=critical,CA:TRUE{}\nkeyUsage=critical,{}\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always,issuer\n", args.pathlen.map_or(String::new(), |value| format!(",pathlen:{value}")), key_usages(&args.key_usage, true))).map_err(fs_error)?;
     let mut root_certificate_args = vec![
@@ -769,11 +831,8 @@ fn create_root(dir: &Path, openssl: &mut OpenSsl, args: &RootArgs) -> Result<Rep
         "-key".into(),
         key.display().to_string(),
     ];
-    if matches!(args.profile, Profile::Rsa4096) {
-        root_certificate_args.extend([
-            "-passin".into(),
-            format!("file:{}", target.join("private/ca.passphrase").display()),
-        ]);
+    if let PassphrasePolicy::Encrypted(path) = &pass {
+        root_certificate_args.extend(["-passin".into(), format!("file:{}", path.display())]);
     }
     root_certificate_args.extend([
         "-sha256".into(),
@@ -864,8 +923,12 @@ fn create_intermediate(
         days,
         &args.key_usage,
     );
-    let planned_artifacts =
-        intermediate_artifact_plan(dir, &target, &extension, args.passphrase_file.is_none());
+    let planned_artifacts = intermediate_artifact_plan(
+        dir,
+        &target,
+        &extension,
+        !matches!(args.passphrase.as_deref(), Some("NONE")),
+    );
     if !args.do_it {
         let mut report = success_with_path(
             &format!("dry-run: intermediate CA would be created for {days} days"),
@@ -882,13 +945,19 @@ fn create_intermediate(
     fs::create_dir_all(target.join("newcerts")).map_err(fs_error)?;
     fs::create_dir_all(target.join("config")).map_err(fs_error)?;
     fs::create_dir_all(target.join("chain")).map_err(fs_error)?;
-    let pass = passphrase(args.passphrase_file.as_deref(), dir, &target, openssl)?;
+    let pass = resolve_passphrase(
+        args.passphrase.as_deref(),
+        args.passphrase_file.as_deref(),
+        dir,
+        &target,
+        true,
+    )?;
     let issuer_passphrase_file = args
         .issuer_passphrase_file
         .as_deref()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| parent_default_passphrase(&parent.path));
-    read_passphrase(dir, &issuer_passphrase_file).map_err(|(_, message)| {
+    let _parent_passphrase = read_passphrase(dir, &issuer_passphrase_file).map_err(|(_, message)| {
         (
             4,
             format!(
@@ -897,53 +966,45 @@ fn create_intermediate(
         )
     })?;
     generate_key(openssl, &profile, &key, &pass)?;
-    run_to_file(
-        openssl,
-        vec![
-            "req".into(),
-            "-new".into(),
-            "-key".into(),
-            key.display().to_string(),
-            "-passin".into(),
-            format!("file:{}", target.join("private/ca.passphrase").display()),
-            "-subj".into(),
-            subject.distinguished_name(),
-            "-out".into(),
-            csr.display().to_string(),
-        ],
-    )?;
-    run_to_file(
-        openssl,
-        vec![
-            "x509".into(),
-            "-req".into(),
-            "-in".into(),
-            csr.display().to_string(),
-            "-CA".into(),
-            parent.path.display().to_string(),
-            "-CAkey".into(),
-            parent
-                .path
-                .parent()
-                .and_then(Path::parent)
-                .map(|ca| ca.join("private/ca.key.pem"))
-                .ok_or((6, "cannot determine parent key path".into()))?
-                .display()
-                .to_string(),
-            "-passin".into(),
-            format!("file:{}", issuer_passphrase_file.display()),
-            "-days".into(),
-            days.to_string(),
-            "-set_serial".into(),
-            "1000".into(),
-            "-extfile".into(),
-            write_extension(dir, &args.name, pathlen, &args.key_usage)?
-                .display()
-                .to_string(),
-            "-out".into(),
-            cert.display().to_string(),
-        ],
-    )?;
+    let mut csr_args = vec![
+        "req".into(),
+        "-new".into(),
+        "-key".into(),
+        key.display().to_string(),
+    ];
+    append_passin(&mut csr_args, &pass);
+    csr_args.extend([
+        "-subj".into(),
+        subject.distinguished_name(),
+        "-out".into(),
+        csr.display().to_string(),
+    ]);
+    run_to_file(openssl, csr_args)?;
+    let mut signing_args = vec![
+        "x509".into(),
+        "-req".into(),
+        "-in".into(),
+        csr.display().to_string(),
+        "-CA".into(),
+        parent.path.display().to_string(),
+        "-CAkey".into(),
+        parent_key.display().to_string(),
+    ];
+    signing_args.extend([
+        "-passin".into(),
+        format!("file:{}", issuer_passphrase_file.display()),
+        "-days".into(),
+        days.to_string(),
+        "-set_serial".into(),
+        "1000".into(),
+        "-extfile".into(),
+        write_extension(dir, &args.name, pathlen, &args.key_usage)?
+            .display()
+            .to_string(),
+        "-out".into(),
+        cert.display().to_string(),
+    ]);
+    run_to_file(openssl, signing_args)?;
     write_new(&target.join("index.txt"), "").map_err(fs_error)?;
     write_new(&target.join("serial"), "1000\n").map_err(fs_error)?;
     let _ = write_chain(&target, &parent.path, &cert);
@@ -999,11 +1060,8 @@ fn create_certificate(
         .as_deref()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| parent_default_passphrase(&issuer.path));
-    read_passphrase(dir, &issuer_passphrase_file)
+    let _issuer_passphrase = read_passphrase(dir, &issuer_passphrase_file)
         .map_err(|(_, message)| (4, format!("cannot read issuer passphrase file: {message}")))?;
-    if let Some(path) = &args.passphrase_file {
-        read_passphrase(dir, path)?;
-    }
     let target = dir.join(profile.text()).join("certs").join(&args.name);
     if target.exists() {
         return Err((5, format!("target already exists: {}", target.display())));
@@ -1024,7 +1082,11 @@ fn create_certificate(
         &subject,
         days,
     );
-    let planned_artifacts = certificate_artifact_plan(dir, &target, args.passphrase_file.is_none());
+    let planned_artifacts = certificate_artifact_plan(
+        dir,
+        &target,
+        !matches!(args.passphrase.as_deref(), Some("NONE")),
+    );
     if !args.do_it {
         let mut report = success_with_path(
             &format!("dry-run: certificate would be created for {days} days"),
@@ -1035,6 +1097,13 @@ fn create_certificate(
         report.planned_artifacts = planned_artifacts;
         return Ok(report);
     }
+    let pass = resolve_passphrase(
+        args.passphrase.as_deref(),
+        args.passphrase_file.as_deref(),
+        dir,
+        &target,
+        false,
+    )?;
     for child in ["private", "csr", "certs", "chain", "config"] {
         fs::create_dir_all(target.join(child)).map_err(|error| {
             (
@@ -1046,18 +1115,7 @@ fn create_certificate(
             )
         })?;
     }
-    let passphrase_file = args
-        .passphrase_file
-        .clone()
-        .unwrap_or_else(|| target.join("private/passphrase"));
     let cleanup_target = target.clone();
-    let pass = if args.passphrase_file.is_some() {
-        read_passphrase(dir, &passphrase_file)?
-    } else {
-        let value = random_passphrase().map_err(|(_, message)| (6, message))?;
-        write_new(&passphrase_file, &format!("{value}\n")).map_err(fs_error)?;
-        value
-    };
     let key = target.join("private/key.pem");
     let csr = target.join("csr/request.csr.pem");
     let cert = target.join("certs/cert.pem");
@@ -1068,21 +1126,20 @@ fn create_certificate(
             format!("cannot generate leaf key {}: {message}", key.display()),
         ));
     }
-    run_to_file(
-        openssl,
-        vec![
-            "req".into(),
-            "-new".into(),
-            "-key".into(),
-            key.display().to_string(),
-            "-passin".into(),
-            format!("file:{}", passphrase_file.display()),
-            "-subj".into(),
-            subject.distinguished_name(),
-            "-out".into(),
-            csr.display().to_string(),
-        ],
-    )?;
+    let mut csr_args = vec![
+        "req".into(),
+        "-new".into(),
+        "-key".into(),
+        key.display().to_string(),
+    ];
+    append_passin(&mut csr_args, &pass);
+    csr_args.extend([
+        "-subj".into(),
+        subject.distinguished_name(),
+        "-out".into(),
+        csr.display().to_string(),
+    ]);
+    run_to_file(openssl, csr_args)?;
     let ext = match write_leaf_extension(&target, &sans, &args.key_usage) {
         Ok(path) => path,
         Err(error) => {
@@ -1091,29 +1148,27 @@ fn create_certificate(
         }
     };
     let issuer_cert = issuer.path.clone();
-    run_to_file(
-        openssl,
-        vec![
-            "x509".into(),
-            "-req".into(),
-            "-in".into(),
-            csr.display().to_string(),
-            "-CA".into(),
-            issuer_cert.display().to_string(),
-            "-CAkey".into(),
-            issuer_key.display().to_string(),
-            "-passin".into(),
-            format!("file:{}", issuer_passphrase_file.display()),
-            "-days".into(),
-            days.to_string(),
-            "-set_serial".into(),
-            "1001".into(),
-            "-extfile".into(),
-            ext.display().to_string(),
-            "-out".into(),
-            cert.display().to_string(),
-        ],
-    )?;
+    let signing_args = vec![
+        "x509".into(),
+        "-req".into(),
+        "-in".into(),
+        csr.display().to_string(),
+        "-CA".into(),
+        issuer_cert.display().to_string(),
+        "-CAkey".into(),
+        issuer_key.display().to_string(),
+        "-passin".into(),
+        format!("file:{}", issuer_passphrase_file.display()),
+        "-days".into(),
+        days.to_string(),
+        "-set_serial".into(),
+        "1001".into(),
+        "-extfile".into(),
+        ext.display().to_string(),
+        "-out".into(),
+        cert.display().to_string(),
+    ];
+    run_to_file(openssl, signing_args)?;
     write_chain(&target, &issuer_cert, &cert)
         .map_err(|error| (6, format!("cannot write certificate chain: {error}")))?;
     let mut report = success_with_path("certificate created", false, relative);
@@ -1125,18 +1180,11 @@ fn generate_key(
     openssl: &mut OpenSsl,
     profile: &Profile,
     path: &Path,
-    _pass: &str,
+    pass: &PassphrasePolicy,
 ) -> Result<(), (u8, String)> {
-    let args = if matches!(profile, Profile::Rsa4096) {
-        let passphrase_file = path
-            .parent()
-            .ok_or((6, "cannot determine key directory".into()))?
-            .join("passphrase");
+    let mut args = if matches!(profile, Profile::Rsa4096) {
         vec![
             "genrsa".into(),
-            "-aes256".into(),
-            "-passout".into(),
-            format!("file:{}", passphrase_file.display()),
             "-out".into(),
             path.display().to_string(),
             "4096".into(),
@@ -1160,6 +1208,18 @@ fn generate_key(
             path.display().to_string(),
         ]
     };
+    if let PassphrasePolicy::Encrypted(path) = pass
+        && matches!(profile, Profile::Rsa4096)
+    {
+        args.splice(
+            1..1,
+            [
+                "-aes256".into(),
+                "-passout".into(),
+                format!("file:{}", path.display()),
+            ],
+        );
+    }
     openssl.run(&args).map_err(|error| (10, error)).map(|_| ())
 }
 
@@ -1167,21 +1227,101 @@ fn run_to_file(openssl: &mut OpenSsl, args: Vec<String>) -> Result<(), (u8, Stri
     openssl.run(&args).map_err(|error| (10, error)).map(|_| ())
 }
 
-fn passphrase(
-    input: Option<&Path>,
+/// Resolves a newly generated key's passphrase selector and publishes its default file.
+///
+/// Input shape: one CLI selector, a PKI root, and an artifact directory.
+/// Output shape: an encrypted policy containing the artifact-local passphrase file,
+/// or a `None` policy for an unencrypted key.
+///
+/// # Arguments
+///
+/// * `passphrase` - Literal text, `PROMPT`, or `NONE`.
+/// * `passphrase_file` - Source path or `AUTO`.
+/// * `dir` - PKI root used to resolve relative source paths.
+/// * `target` - Artifact directory receiving the default passphrase file.
+/// * `ca` - Whether the default file is named `ca.passphrase` instead of `passphrase`.
+///
+/// # Returns
+///
+/// The resolved key-encryption policy.
+///
+/// # Errors
+///
+/// Returns an input, prompt, randomness, or filesystem error when the selector cannot be resolved.
+fn resolve_passphrase(
+    passphrase: Option<&str>,
+    passphrase_file: Option<&str>,
     dir: &Path,
     target: &Path,
-    _openssl: &mut OpenSsl,
-) -> Result<String, (u8, String)> {
-    if let Some(path) = input {
-        let value = read_passphrase(dir, path)?;
-        write_new(&target.join("private/ca.passphrase"), &format!("{value}\n"))
-            .map_err(fs_error)?;
-        return Ok(value);
+    ca: bool,
+) -> Result<PassphrasePolicy, (u8, String)> {
+    if passphrase.is_some() == passphrase_file.is_some() {
+        return Err((
+            4,
+            "exactly one of --passphrase or --passphrase-file is required".into(),
+        ));
     }
-    let value = random_passphrase()?;
-    write_new(&target.join("private/ca.passphrase"), &format!("{value}\n")).map_err(fs_error)?;
+    let destination = target.join(if ca {
+        "private/ca.passphrase"
+    } else {
+        "private/passphrase"
+    });
+    if let Some(value) = passphrase {
+        if value == "NONE" {
+            return Ok(PassphrasePolicy::None);
+        }
+        let value = if value == "PROMPT" {
+            prompt_passphrase()?
+        } else {
+            validate_passphrase_value(value)?;
+            value.to_owned()
+        };
+        write_new(&destination, &format!("{value}\n")).map_err(fs_error)?;
+        return Ok(PassphrasePolicy::Encrypted(destination));
+    }
+    let source = passphrase_file.expect("validated exactly-one passphrase selector");
+    let value = if source == "AUTO" {
+        random_passphrase()?
+    } else {
+        read_passphrase(dir, Path::new(source))?
+    };
+    write_new(&destination, &format!("{value}\n")).map_err(fs_error)?;
+    Ok(PassphrasePolicy::Encrypted(destination))
+}
+
+fn validate_passphrase_value(value: &str) -> Result<(), (u8, String)> {
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        return Err((4, "passphrase must be nonempty and single-line".into()));
+    }
+    Ok(())
+}
+
+fn prompt_passphrase() -> Result<String, (u8, String)> {
+    if !io::stdin().is_terminal() {
+        return Err((4, "PROMPT requires an interactive terminal".into()));
+    }
+    let first = read_masked("Passphrase: ")?;
+    let second = read_masked("Confirm passphrase: ")?;
+    if first != second {
+        return Err((4, "passphrase confirmation did not match".into()));
+    }
+    validate_passphrase_value(&first)?;
+    Ok(first)
+}
+
+fn read_masked(prompt: &str) -> Result<String, (u8, String)> {
+    eprint!("{prompt}");
+    io::stderr().flush().map_err(fs_error)?;
+    let value = rpassword::read_password()
+        .map_err(|error| (4, format!("cannot read passphrase: {error}")))?;
+    eprintln!();
     Ok(value)
+}
+
+fn append_passin(args: &mut Vec<String>, policy: &PassphrasePolicy) {
+    if let PassphrasePolicy::Encrypted(path) = policy {
+        args.extend(["-passin".into(), format!("file:{}", path.display())]);
+    }
 }
 
 /// Creates a cryptographically random 256-bit passphrase.

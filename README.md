@@ -174,6 +174,9 @@ pki --dir ./pki \
   --common-name "Example Root CA" \
   --organization Example \
   --passphrase-file root.pass
+# or: --passphrase PROMPT
+# or: --passphrase NONE
+# or: --passphrase-file AUTO
 ```
 
 A dry run:
@@ -191,9 +194,24 @@ For example, a root dry run reports commands such as `openssl ecparam ...` and `
 
 After reviewing the dry-run output, repeat the command with `--do-it` after the selected create subcommand and its arguments.
 
-## Passphrase files
+## Passphrase selection
 
-Leaf and issuer passphrase files must already exist. For root and intermediate child keys, `--passphrase-file` is optional: during `--do-it`, omitting it generates a 256-bit passphrase and atomically publishes it with the CA at `private/ca.passphrase`. Explicitly supplied files are never replaced, and no generated companion file is created for them.
+Every `create-ca` and `create-cert` command requires exactly one of `--passphrase` or `--passphrase-file`. The options cannot be combined.
+
+`--passphrase` accepts:
+
+- A literal single-line passphrase. It is saved to the artifact's default passphrase file.
+- `PROMPT`, which reads a masked passphrase twice and saves the confirmed value.
+- `NONE`, which creates an unencrypted private key and no passphrase file.
+
+`--passphrase-file` accepts:
+
+- An existing passphrase file. Its contents are validated and copied to the artifact's default passphrase file.
+- `AUTO`, which generates a 256-bit passphrase and saves it to the default passphrase file.
+
+The control values are uppercase and case-sensitive. `PROMPT` requires an interactive terminal. Dry runs never prompt, generate secrets, copy files, or create artifacts. The selector protects the newly generated key; parent and issuer passphrases remain separate and are loaded from their existing passphrase files or explicit override options.
+
+A passphrase file must be a regular, nonempty, single-line file. Passphrase values are never placed in OpenSSL arguments, reports, or logs. `NONE` intentionally reduces private-key protection at rest.
 
 A passphrase file must be:
 
@@ -222,6 +240,9 @@ Relative passphrase paths are resolved relative to `--dir`:
 
 ```text
 --dir ./pki --passphrase-file root.pass
+# or: --passphrase PROMPT
+# or: --passphrase NONE
+# or: --passphrase-file AUTO
 ```
 
 Absolute paths are accepted only if they remain beneath `--dir`.
@@ -294,6 +315,9 @@ pki --dir ./pki \
   --common-name "Example Root CA" \
   --organization Example \
   --passphrase-file root.pass
+# or: --passphrase PROMPT
+# or: --passphrase NONE
+# or: --passphrase-file AUTO
 ```
 
 Execute:
@@ -306,6 +330,9 @@ pki --dir ./pki \
   --common-name "Example Root CA" \
   --organization Example \
   --passphrase-file root.pass
+# or: --passphrase PROMPT
+# or: --passphrase NONE
+# or: --passphrase-file AUTO
 ```
 
 Important options:
@@ -542,6 +569,9 @@ Use `-v` or `--verbose` before the subcommand to add a safe execution report. Hu
 ```sh
 pki --dir ./pki --verbose create-ca --do-it \
   --common-name "Example Root CA" --organization Example --passphrase-file root.pass
+# or: --passphrase PROMPT
+# or: --passphrase NONE
+# or: --passphrase-file AUTO
 pki --dir ./pki --verbose --json create-cert --do-it --root \
   --name service --common-name service.example --organization Example \
   --san service.example --passphrase-file leaf.pass --issuer-passphrase-file root.pass
@@ -692,6 +722,9 @@ docker run --rm \
    --common-name "Example Root" \
    --organization Example \
    --passphrase-file root.pass
+# or: --passphrase PROMPT
+# or: --passphrase NONE
+# or: --passphrase-file AUTO
 
 docker run --rm \
   --mount "type=bind,src=$work,dst=/data/pki" \
