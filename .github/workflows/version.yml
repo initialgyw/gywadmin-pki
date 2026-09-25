@@ -1,0 +1,73 @@
+name: Version
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Validate version bump
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.90.0
+          cache: true
+
+      - name: Validate package version bump
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_SHA"
+
+          current_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "gywadmin-pki") | .version')"
+          base_version="$(git show "$BASE_SHA:Cargo.toml" | awk -F'"' '$1 ~ /^version[[:space:]]*=/ { print $2; exit }')"
+          lock_version="$(awk '
+            /^name = "gywadmin-pki"$/ { package = 1; next }
+            package && /^version = / { gsub(/"/, "", $3); print $3; exit }
+            /^\[\[package\]\]$/ { package = 0 }
+          ' Cargo.lock)"
+
+          if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Current version must be stable SemVer MAJOR.MINOR.PATCH: $current_version" >&2
+            exit 1
+          fi
+          if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Base version must be stable SemVer MAJOR.MINOR.PATCH: $base_version" >&2
+            exit 1
+          fi
+          if [[ "$lock_version" != "$current_version" ]]; then
+            echo "Cargo.lock root package version ($lock_version) does not match Cargo.toml ($current_version)" >&2
+            exit 1
+          fi
+
+          IFS=. read -r current_major current_minor current_patch <<< "$current_version"
+          IFS=. read -r base_major base_minor base_patch <<< "$base_version"
+          version_is_greater=false
+          if (( current_major > base_major )); then
+            version_is_greater=true
+          elif (( current_major == base_major && current_minor > base_minor )); then
+            version_is_greater=true
+          elif (( current_major == base_major && current_minor == base_minor && current_patch > base_patch )); then
+            version_is_greater=true
+          fi
+
+          if [[ "$version_is_greater" != true ]]; then
+            echo "Version must increase from $base_version to a new version; found $current_version" >&2
+            exit 1
+          fi
+
+          echo "Version bump validated: $base_version -> $current_version"

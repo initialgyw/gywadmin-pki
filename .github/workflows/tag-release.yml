@@ -10,6 +10,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: tag-release-main
+  cancel-in-progress: false
+
 jobs:
   tag:
     if: github.event.pull_request.merged == true
@@ -18,9 +22,9 @@ jobs:
       - name: Check out merged commit
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -32,8 +36,9 @@ jobs:
         id: version
         shell: bash
         run: |
+          set -euo pipefail
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "gywadmin-pki") | .version')"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Invalid project version: $version" >&2
             exit 1
           fi
@@ -42,17 +47,11 @@ jobs:
       - name: Create or verify tag
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
-          if [[ -z "$RELEASE_TOKEN" ]]; then
-            echo "RELEASE_TOKEN is required" >&2
-            exit 1
-          fi
-
+          set -euo pipefail
           tag="v${VERSION}"
-          commit="$(git rev-parse HEAD)"
+          commit="${{ github.event.pull_request.merge_commit_sha }}"
           existing="$(git ls-remote --tags origin "refs/tags/${tag}" | awk '{print $1}')"
 
           if [[ -n "$existing" ]]; then
@@ -65,4 +64,4 @@ jobs:
           fi
 
           git tag "$tag" "$commit"
-          git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${REPOSITORY}.git" "$tag"
+          git push origin "refs/tags/${tag}"

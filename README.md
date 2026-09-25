@@ -136,6 +136,19 @@ docker run --rm \
   -c 'id; command -v openssl; openssl version'
 ```
 
+## Release process
+
+Every pull request that changes the project must manually bump the package version in `Cargo.toml`. The version must be a stable `MAJOR.MINOR.PATCH` SemVer value greater than the version on `main`, and the root `gywadmin-pki` package version in `Cargo.lock` must match it. The version validation workflow rejects unchanged, downgraded, malformed, or lockfile-mismatched versions. Configure the `Version / Validate version bump` workflow as a required pull-request status check in branch protection.
+
+After a version-bumped pull request is merged into `main`, the release workflow reads the version from the exact merge commit and creates the corresponding immutable tag, such as `v0.1.1`. Existing tags are never moved. A matching release tag triggers the container workflow, which builds and publishes both `linux/amd64` and `linux/arm64` images to GitHub Container Registry:
+
+```text
+ghcr.io/initialgyw/gywadmin-pki:0.1.1
+ghcr.io/initialgyw/gywadmin-pki:latest
+```
+
+The `latest` tag is updated for stable releases. The workflows require repository Actions permissions that allow `contents: write` for release tagging and `packages: write` for GHCR publishing. If a tag workflow reports that a version already exists at another commit, bump the package version again rather than moving the existing tag.
+
 ## Global options
 
 The global options appear before the subcommand:
